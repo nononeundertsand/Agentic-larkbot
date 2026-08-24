@@ -91,7 +91,9 @@ export function createAgentTrace({
     status: 'running',
     userTextPreview: previewForTrace(userText, { mode: selectedMode }),
     memoryBriefPreview: previewForTrace(ctx.memoryBrief || '', { mode: selectedMode }),
+    personaMemoryBriefPreview: previewForTrace(ctx.personaMemoryBrief || '', { mode: selectedMode }),
     groupMemoryBriefPreview: previewForTrace(ctx.groupMemoryBrief || '', { mode: selectedMode }),
+    groupPersonaMemoryBriefPreview: previewForTrace(ctx.groupPersonaMemoryBrief || '', { mode: selectedMode }),
     prompt: {
       messageCount: Array.isArray(messages) ? messages.length : 0,
       totalChars: totalMessageChars(messages),

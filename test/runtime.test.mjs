@@ -373,6 +373,133 @@ test('结构化长期记忆按相关性检索并遗忘过期项', async () => {
   }
 });
 
+test('人格专属记忆只在对应人格上下文注入，共享记忆仍跨人格可见', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-persona-memory-'));
+  process.env.MEMORY_DATA_DIR = dir;
+  process.env.MEMORY_CONTEXT_BUDGET_CHARS = '2400';
+  const senderId = 'ou_persona_user';
+  const userDir = join(dir, '人格用户_ona_user');
+  const now = new Date().toISOString();
+  mkdirSync(userDir, { recursive: true });
+  writeFileSync(join(userDir, 'p2p.json'), JSON.stringify({
+    scene: 'p2p',
+    chatType: 'p2p',
+    summary: '',
+    facts: {},
+    memories: [
+      {
+        id: 'm_shared',
+        scope: 'p2p',
+        type: 'fact',
+        source: 'llm',
+        key: 'project',
+        content: 'larkbot 正在升级人格记忆系统',
+        confidence: 0.9,
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: null,
+        useCount: 0,
+      },
+    ],
+    personaMemories: {
+      academic_serious: [
+        {
+          id: 'm_academic',
+          scope: 'p2p:academic_serious',
+          type: 'preference',
+          source: 'llm',
+          key: 'academic_answer_style',
+          content: '学术人格回答数学问题时先检查 Jacobian determinant',
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: null,
+          useCount: 0,
+        },
+      ],
+      daily_assistant: [
+        {
+          id: 'm_daily',
+          scope: 'p2p:daily_assistant',
+          type: 'preference',
+          source: 'llm',
+          key: 'daily_answer_style',
+          content: '日常人格回复普通群聊时保持轻松简短',
+          confidence: 0.9,
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: null,
+          useCount: 0,
+        },
+      ],
+    },
+    updatedAt: new Date().toISOString(),
+  }));
+
+  try {
+    const memory = await import(`../src/memory.mjs?persona=${Date.now()}`);
+    const key = memory.sessionKey({
+      chatType: 'p2p',
+      senderId,
+      senderName: '人格用户',
+    });
+    const academic = memory.buildContext(key, {
+      persist: true,
+      query: 'larkbot 学术回答 Jacobian',
+      personaId: 'academic_serious',
+      budgetChars: 2400,
+    });
+    assert.match(academic.memoryBrief, /人格记忆系统/);
+    assert.match(academic.personaMemoryBrief, /Jacobian determinant/);
+    assert.doesNotMatch(academic.personaMemoryBrief, /轻松简短/);
+
+    const daily = memory.buildContext(key, {
+      persist: true,
+      query: 'larkbot 日常回复 风格',
+      personaId: 'daily_assistant',
+      budgetChars: 2400,
+    });
+    assert.match(daily.memoryBrief, /人格记忆系统/);
+    assert.match(daily.personaMemoryBrief, /轻松简短/);
+    assert.doesNotMatch(daily.personaMemoryBrief, /Jacobian determinant/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('人格记忆分流器只把回答风格和推理习惯写入 persona scope', async () => {
+  const memory = await import(`../src/memory.mjs?persona_split=${Date.now()}`);
+  const items = memory.__testing.normalizeMemoryItems([
+    {
+      id: 'm_style',
+      scope: 'p2p',
+      type: 'preference',
+      source: 'llm',
+      key: 'academic_answer_style',
+      content: '学术回答先说明定义，再进行严谨证明',
+      confidence: 0.9,
+    },
+    {
+      id: 'm_project',
+      scope: 'p2p',
+      type: 'fact',
+      source: 'llm',
+      key: 'project',
+      content: 'larkbot 使用 JSON 记忆存储',
+      confidence: 0.9,
+    },
+  ], {}, { scope: 'p2p' });
+  const split = memory.__testing.splitPersonaScopedMemories(items, {
+    personaId: 'academic_serious',
+    baseScope: 'p2p',
+  });
+  assert.equal(split.persona.length, 1);
+  assert.equal(split.persona[0].personaId, 'academic_serious');
+  assert.match(split.persona[0].scope, /academic_serious/);
+  assert.equal(split.shared.length, 1);
+  assert.equal(split.shared[0].key, 'project');
+});
+
 test('轻量知识图谱按实体关系召回相邻记忆', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'larkbot-graph-memory-'));
   process.env.MEMORY_DATA_DIR = dir;

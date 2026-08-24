@@ -80,6 +80,7 @@
   - 仅在当前设置为 `auto` 时，专业数学/证明/论文/算法问题才会临时切到学术人格，避免固定人格被隐式覆盖
   - 新增 `list_personas` / `switch_persona` / `clear_chat_persona` 主人专属工具，支持查看人格、持久切换全局/当前群人格，以及清除当前群覆盖；切换需确认卡片或确认码确认后生效
   - 人格配置落入 `RuntimeStateStore.persona`，重启后可恢复
+  - 记忆层升级为 shared memory + persona-scoped memory：事实/关系/项目背景继续共享，回答风格、推理习惯、输出结构按当前人格分桶召回
   - 人格只影响表达、回答结构、推理深度和工具使用偏好，不改变安全策略与工具权限
 - W0 复杂任务接口设计：已完成第一版。
   - 新增 `src/workflow-schema.mjs`

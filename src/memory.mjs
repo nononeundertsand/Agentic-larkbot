@@ -8,10 +8,10 @@
 //   持久化布局（按用户分目录，方便人工查看/调整）：
 //   data/memory/<用户名_openid短码>/
 //     ├── profile.json          用户身份 {name, department, email, openId}
-//     ├── p2p.json              私聊场景 {summary, facts, memories, graph, updatedAt}
-//     └── group_<chatId>.json   各群场景 {summary, facts, memories, graph, updatedAt}
+//     ├── p2p.json              私聊场景 {summary, facts, memories, graph, personaMemories, personaGraph, updatedAt}
+//     └── group_<chatId>.json   各群场景 {summary, facts, memories, graph, personaMemories, personaGraph, updatedAt}
 //   data/memory/groups/
-//     └── group_<chatId>.json   群共享记忆 {summary, facts, memories, graph, updatedAt}
+//     └── group_<chatId>.json   群共享记忆 {summary, facts, memories, graph, personaMemories, personaGraph, updatedAt}
 //   同一用户的所有会话集中在其目录内；短期原文不落盘。
 //
 // 维护时机（省成本）：回复后异步调用 maintainMemory()：
@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { updateSummary, extractKeyMemory, updateGroupSummary, extractGroupKeyMemory, currentDefaultModelId } from './reply.mjs';
+import { normalizePersonaId } from './persona.mjs';
 
 const SHORT_TURNS = Number(process.env.MEMORY_SHORT_TURNS || 30); // 短期滑动窗口轮数
 const TTL_MS = Number(process.env.MEMORY_TTL_MS || 30 * 60 * 1000); // 短期无活动过期
@@ -38,6 +39,7 @@ const MEMORY_TEMP_TTL_MS = Number(process.env.MEMORY_TEMP_TTL_MS || 3 * 24 * 360
 const MEMORY_TASK_TTL_MS = Number(process.env.MEMORY_TASK_TTL_MS || 14 * 24 * 3600 * 1000);
 const MEMORY_DECISION_TTL_MS = Number(process.env.MEMORY_DECISION_TTL_MS || 180 * 24 * 3600 * 1000);
 const MEMORY_STALE_MS = Number(process.env.MEMORY_STALE_MS || 120 * 24 * 3600 * 1000);
+const MEMORY_PERSONA_RELEVANT_LIMIT = Number(process.env.MEMORY_PERSONA_RELEVANT_LIMIT || Math.max(4, Math.floor(MEMORY_RELEVANT_LIMIT / 2)));
 // 是否把短期记忆（最近 N 轮原文）也落盘。默认 off：短期仅存内存、重启清空。
 // 开启后短期原文写入各场景文件的 messages 字段，重启可恢复（受 TTL 约束，过期的不恢复）。
 const PERSIST_SHORT = (process.env.MEMORY_PERSIST_SHORT || 'off').toLowerCase() === 'on';
@@ -135,9 +137,62 @@ function memoryWritePolicy(key, content, { source = 'llm' } = {}) {
 function memoryIsActive(item) {
   return (item?.status || 'active') === 'active';
 }
-function factsToMemoryItems(facts, { scope = 'session', source = 'llm', provenance = {} } = {}) {
+function activePersonaId(value) {
+  return normalizePersonaId(value) || '';
+}
+function scopeWithPersona(scope, personaId) {
+  const id = activePersonaId(personaId);
+  return id ? `${scope || 'session'}:${id}` : (scope || 'session');
+}
+function normalizePersonaMemories(raw = {}, { scope = 'session' } = {}) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [personaId, items] of Object.entries(raw)) {
+    const id = activePersonaId(personaId);
+    if (!id) continue;
+    out[id] = normalizeMemoryItems(items, {}, { scope: scopeWithPersona(scope, id) })
+      .map((item) => ({ ...item, personaId: id, scope: scopeWithPersona(scope, id) }));
+  }
+  return out;
+}
+function normalizePersonaGraph(raw = {}, { scope = 'session' } = {}) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [personaId, graph] of Object.entries(raw)) {
+    const id = activePersonaId(personaId);
+    if (!id) continue;
+    const normalized = normalizeGraph(graph, { scope: scopeWithPersona(scope, id), personaId: id });
+    out[id] = {
+      ...normalized,
+      edges: (normalized.edges || []).map((edge) => ({ ...edge, personaId: id, scope: scopeWithPersona(scope, id) })),
+    };
+  }
+  return out;
+}
+function prunePersonaMemories(raw = {}) {
+  const out = {};
+  for (const [personaId, items] of Object.entries(raw || {})) {
+    const id = activePersonaId(personaId);
+    if (!id) continue;
+    const pruned = pruneMemories(items || []);
+    if (pruned.length) out[id] = pruned;
+  }
+  return out;
+}
+function personaGraphToPersist(raw = {}) {
+  const out = {};
+  for (const [personaId, graph] of Object.entries(raw || {})) {
+    const id = activePersonaId(personaId);
+    if (!id) continue;
+    const persisted = graphToPersist(graph);
+    if (persisted.edges.length) out[id] = persisted;
+  }
+  return out;
+}
+function factsToMemoryItems(facts, { scope = 'session', source = 'llm', provenance = {}, personaId = '' } = {}) {
   if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return [];
   const createdAt = nowIso();
+  const normalizedPersonaId = activePersonaId(personaId);
   return Object.entries(facts)
     .filter(([, value]) => value != null && String(value).trim())
     .map(([key, value]) => {
@@ -149,6 +204,7 @@ function factsToMemoryItems(facts, { scope = 'session', source = 'llm', provenan
         scope,
         type,
         source,
+        personaId: normalizedPersonaId,
         key: String(key),
         content,
         confidence: source === 'legacy' ? 0.65 : 0.75,
@@ -186,6 +242,7 @@ function normalizeMemoryItems(rawItems, legacyFacts, { scope = 'session' } = {})
       confidence: Number.isFinite(Number(item.confidence)) ? Math.max(0, Math.min(1, Number(item.confidence))) : 0.7,
       status: item.status || 'active',
       policyReason: item.policyReason || '',
+      personaId: activePersonaId(item.personaId),
       conflictWith: Array.isArray(item.conflictWith) ? item.conflictWith : [],
       conflictReason: item.conflictReason || '',
       supersededBy: item.supersededBy || '',
@@ -478,8 +535,9 @@ function rawGraphEdges(raw) {
   if (raw.graph && typeof raw.graph === 'object') return rawGraphEdges(raw.graph);
   return [];
 }
-function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm', provenance = {} } = {}) {
+function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm', provenance = {}, personaId = '' } = {}) {
   const now = nowIso();
+  const normalizedPersonaId = activePersonaId(personaId);
   const edges = [];
   for (const raw of Array.isArray(rawEdges) ? rawEdges : []) {
     if (!raw || typeof raw !== 'object') continue;
@@ -498,6 +556,7 @@ function normalizeGraphEdges(rawEdges, { scope = 'session', origin = 'llm', prov
       description: String(raw.description || raw.note || '').trim(),
       confidence: clampConfidence(raw.confidence, origin === 'legacy' ? 0.65 : 0.75),
       origin: raw.origin || raw.memorySource || origin,
+      personaId: normalizedPersonaId || activePersonaId(raw.personaId),
       status: raw.status || policy.status,
       policyReason: raw.policyReason || policy.policyReason,
       conflictWith: Array.isArray(raw.conflictWith) ? raw.conflictWith : [],
@@ -618,8 +677,8 @@ function pruneGraphEdges(edges) {
     })
     .slice(0, MEMORY_GRAPH_EDGE_LIMIT);
 }
-function normalizeGraph(raw, { scope = 'session', origin = 'legacy' } = {}) {
-  return { edges: pruneGraphEdges(mergeGraphEdges([], normalizeGraphEdges(rawGraphEdges(raw), { scope, origin }))) };
+function normalizeGraph(raw, { scope = 'session', origin = 'legacy', personaId = '' } = {}) {
+  return { edges: pruneGraphEdges(mergeGraphEdges([], normalizeGraphEdges(rawGraphEdges(raw), { scope, origin, personaId }))) };
 }
 function graphNodesFromEdges(edges) {
   const byKey = new Map();
@@ -660,6 +719,88 @@ function graphForPrompt(graph) {
       confidence,
     }));
   return { edges };
+}
+const PERSONA_MEMORY_RE =
+  /(人格|回答|回复|语气|口吻|风格|表达|输出|格式|结构|推理习惯|证明习惯|学术人格|数学人格|严谨程度|详细程度|简洁程度|先.*再|验算流程|校验流程)/i;
+const SHARED_FACT_KEY_RE =
+  /^(name|姓名|称呼|身份|角色|部门|邮箱|profile|role|project|active_projects|member_roles|group_topic|standing_decisions|待办|任务|todo)$/i;
+function shouldRouteMemoryToPersona(item, personaId) {
+  if (!activePersonaId(personaId)) return false;
+  const key = String(item?.key || '');
+  const type = String(item?.type || '');
+  const content = memoryContent(item);
+  const corpus = `${key} ${type} ${content}`;
+  if (SHARED_FACT_KEY_RE.test(key) && !/(回答|回复|风格|语气|推理|证明|学术|格式|结构)/i.test(corpus)) return false;
+  return PERSONA_MEMORY_RE.test(corpus) && ['preference', 'decision', 'fact'].includes(type || 'fact');
+}
+function splitPersonaScopedMemories(items, { personaId = '', baseScope = 'session' } = {}) {
+  const id = activePersonaId(personaId);
+  if (!id) return { shared: items || [], persona: [] };
+  const shared = [];
+  const persona = [];
+  for (const item of items || []) {
+    if (shouldRouteMemoryToPersona(item, id)) {
+      persona.push({
+        ...item,
+        scope: scopeWithPersona(baseScope, id),
+        personaId: id,
+      });
+    } else {
+      shared.push({ ...item, personaId: '' });
+    }
+  }
+  return { shared, persona };
+}
+function shouldRouteEdgeToPersona(edge, personaId) {
+  if (!activePersonaId(personaId)) return false;
+  return PERSONA_MEMORY_RE.test(graphEdgeText(edge));
+}
+function splitPersonaScopedGraphEdges(edges, { personaId = '', baseScope = 'session' } = {}) {
+  const id = activePersonaId(personaId);
+  if (!id) return { shared: edges || [], persona: [] };
+  const shared = [];
+  const persona = [];
+  for (const edge of edges || []) {
+    if (shouldRouteEdgeToPersona(edge, id)) {
+      persona.push({
+        ...edge,
+        scope: scopeWithPersona(baseScope, id),
+        personaId: id,
+      });
+    } else {
+      shared.push({ ...edge, personaId: '' });
+    }
+  }
+  return { shared, persona };
+}
+function mergePersonaMemories(map = {}, personaId = '', incoming = [], { baseScope = 'session' } = {}) {
+  const id = activePersonaId(personaId);
+  const next = prunePersonaMemories(map);
+  if (!id || !incoming?.length) return next;
+  const scoped = incoming.map((item) => ({ ...item, personaId: id, scope: scopeWithPersona(baseScope, id) }));
+  next[id] = mergeMemories(next[id] || [], scoped);
+  return prunePersonaMemories(next);
+}
+function mergePersonaGraph(map = {}, personaId = '', incoming = [], { baseScope = 'session' } = {}) {
+  const id = activePersonaId(personaId);
+  const next = {};
+  for (const [key, graph] of Object.entries(map || {})) {
+    const normalized = activePersonaId(key);
+    if (normalized) next[normalized] = { edges: pruneGraphEdges(graph?.edges || []) };
+  }
+  if (!id || !incoming?.length) return next;
+  const scoped = incoming.map((edge) => ({ ...edge, personaId: id, scope: scopeWithPersona(baseScope, id) }));
+  next[id] = { edges: mergeGraphEdges(next[id]?.edges || [], scoped) };
+  return next;
+}
+function personaIdFromTurns(turns = []) {
+  const counts = new Map();
+  for (const turn of turns || []) {
+    const id = activePersonaId(turn?.personaId);
+    if (!id) continue;
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
 }
 function splitExtractedKnowledge(raw, { scope = 'session', provenance = {} } = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { facts: {}, edges: [] };
@@ -863,6 +1004,12 @@ function loadPersisted(desc, s) {
       s.graph = normalizeGraph(data.graph || data.graphEdges || data.graph_edges, {
         scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
       });
+      s.personaMemories = normalizePersonaMemories(data.personaMemories, {
+        scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
+      });
+      s.personaGraph = normalizePersonaGraph(data.personaGraph || data.personaGraphs, {
+        scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
+      });
       // 短期原文恢复：仅当开关开启、磁盘上有 messages，且最近活动未超过 TTL（避免捞回很久以前的对话）。
       if (PERSIST_SHORT && Array.isArray(data.messages) && data.messages.length) {
         const savedAt = data.updatedAt ? Date.parse(data.updatedAt) : 0;
@@ -892,7 +1039,11 @@ function persist(desc, s) {
       updatedAt: new Date().toISOString(),
     };
     const graph = graphToPersist(s.graph);
+    const personaMemories = prunePersonaMemories(s.personaMemories || {});
+    const personaGraph = personaGraphToPersist(s.personaGraph || {});
     if (graph.edges.length) payload.graph = graph;
+    if (Object.keys(personaMemories).length) payload.personaMemories = personaMemories;
+    if (Object.keys(personaGraph).length) payload.personaGraph = personaGraph;
     if (PERSIST_SHORT) payload.messages = (s.messages || []).slice(-SHORT_TURNS * 2);
     atomicWriteJson(sceneFile(desc), payload);
     persistProfile(desc);
@@ -910,6 +1061,8 @@ function loadPersistedGroup(chatId, s) {
     s.facts = data.facts && typeof data.facts === 'object' ? data.facts : {};
     s.memories = normalizeMemoryItems(data.memories, s.facts, { scope: 'group' });
     s.graph = normalizeGraph(data.graph || data.graphEdges || data.graph_edges, { scope: 'group' });
+    s.personaMemories = normalizePersonaMemories(data.personaMemories, { scope: 'group' });
+    s.personaGraph = normalizePersonaGraph(data.personaGraph || data.personaGraphs, { scope: 'group' });
     if (PERSIST_SHORT && Array.isArray(data.messages) && data.messages.length) {
       const savedAt = data.updatedAt ? Date.parse(data.updatedAt) : 0;
       if (!savedAt || Date.now() - savedAt <= TTL_MS) {
@@ -934,7 +1087,11 @@ function persistGroup(chatId, s) {
       updatedAt: new Date().toISOString(),
     };
     const graph = graphToPersist(s.graph);
+    const personaMemories = prunePersonaMemories(s.personaMemories || {});
+    const personaGraph = personaGraphToPersist(s.personaGraph || {});
     if (graph.edges.length) payload.graph = graph;
+    if (Object.keys(personaMemories).length) payload.personaMemories = personaMemories;
+    if (Object.keys(personaGraph).length) payload.personaGraph = personaGraph;
     if (PERSIST_SHORT) payload.messages = (s.messages || []).slice(-SHORT_TURNS * 2);
     atomicWriteJson(groupFile(chatId), payload);
   } catch (err) {
@@ -952,10 +1109,12 @@ function getSession(key, { persist: usePersist } = {}) {
     s.evicted = [];
   }
   if (!s) {
-    s = { desc, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, evicted: [], turnsSinceExtract: 0 };
+    s = { desc, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, personaMemories: {}, personaGraph: {}, evicted: [], turnsSinceExtract: 0 };
     if (usePersist) loadPersisted(desc, s);
     s.memories = pruneMemories(s.memories || []);
     s.graph = normalizeGraph(s.graph, { scope: desc.chatType === 'group' ? 'group_user' : 'p2p' });
+    s.personaMemories = prunePersonaMemories(s.personaMemories || {});
+    s.personaGraph = normalizePersonaGraph(s.personaGraph || {}, { scope: desc.chatType === 'group' ? 'group_user' : 'p2p' });
     s.facts = memoriesToFacts(s.memories.length ? s.memories : factsToMemoryItems(s.facts, {
       scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
       source: 'legacy',
@@ -970,6 +1129,8 @@ function getSession(key, { persist: usePersist } = {}) {
     // 身份资料可能补全或更新，保持目录描述与最新上下文一致。
     s.desc = { ...s.desc, ...desc };
     if (!s.graph) s.graph = { edges: [] };
+    if (!s.personaMemories) s.personaMemories = {};
+    if (!s.personaGraph) s.personaGraph = {};
   }
   return s;
 }
@@ -982,10 +1143,12 @@ function getGroupSession(chatId, { persist: usePersist } = {}) {
     s.evicted = [];
   }
   if (!s) {
-    s = { chatId: id, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, evicted: [], turnsSinceExtract: 0 };
+    s = { chatId: id, updatedAt: Date.now(), messages: [], summary: '', facts: {}, memories: [], graph: { edges: [] }, personaMemories: {}, personaGraph: {}, evicted: [], turnsSinceExtract: 0 };
     if (usePersist) loadPersistedGroup(id, s);
     s.memories = pruneMemories(s.memories || []);
     s.graph = normalizeGraph(s.graph, { scope: 'group' });
+    s.personaMemories = prunePersonaMemories(s.personaMemories || {});
+    s.personaGraph = normalizePersonaGraph(s.personaGraph || {}, { scope: 'group' });
     s.facts = memoriesToFacts(s.memories.length ? s.memories : factsToMemoryItems(s.facts, { scope: 'group', source: 'legacy' }));
     groupStore.set(id, s);
     if (groupStore.size > MAX_SESSIONS) {
@@ -996,15 +1159,22 @@ function getGroupSession(chatId, { persist: usePersist } = {}) {
   } else if (!s.graph) {
     s.graph = { edges: [] };
   }
+  if (!s.personaMemories) s.personaMemories = {};
+  if (!s.personaGraph) s.personaGraph = {};
   return s;
 }
 
 // 组装给模型的上下文：按相关性和预算返回精简 history / summary / memories。
-export function buildContext(key, { persist: usePersist = false, query = '', budgetChars = CONTEXT_BUDGET_CHARS } = {}) {
+export function buildContext(key, { persist: usePersist = false, query = '', budgetChars = CONTEXT_BUDGET_CHARS, personaId = '' } = {}) {
   const s = getSession(key, { persist: usePersist });
   const memoryBudget = Math.max(1200, Math.floor(budgetChars * 0.25));
-  const graphBudget = Math.max(500, Math.floor(memoryBudget * 0.45));
-  const factBudget = Math.max(500, memoryBudget - graphBudget);
+  const activePersona = activePersonaId(personaId);
+  const personaBudget = activePersona ? Math.max(500, Math.floor(memoryBudget * 0.3)) : 0;
+  const sharedMemoryBudget = Math.max(700, memoryBudget - personaBudget);
+  const graphBudget = Math.max(400, Math.floor(sharedMemoryBudget * 0.45));
+  const factBudget = Math.max(400, sharedMemoryBudget - graphBudget);
+  const personaGraphBudget = activePersona ? Math.max(200, Math.floor(personaBudget * 0.35)) : 0;
+  const personaFactBudget = activePersona ? Math.max(250, personaBudget - personaGraphBudget) : 0;
   const historyBudget = Math.max(2400, Math.floor(budgetChars * 0.55));
   const summaryBudget = Math.max(600, Math.floor(budgetChars * 0.12));
   const q = query || s.messages.at(-1)?.content || '';
@@ -1014,23 +1184,47 @@ export function buildContext(key, { persist: usePersist = false, query = '', bud
   const selectedGraph = usePersist
     ? selectRelevantGraphEdges(s.graph?.edges || [], q, { budgetChars: graphBudget })
     : [];
+  const selectedPersona = (usePersist && activePersona)
+    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], q, {
+      limit: MEMORY_PERSONA_RELEVANT_LIMIT,
+      budgetChars: personaFactBudget,
+    })
+    : [];
+  const selectedPersonaGraph = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], q, {
+      limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+      budgetChars: personaGraphBudget,
+    })
+    : [];
   const graphBrief = formatGraphBrief(selectedGraph);
+  const personaGraphBrief = formatGraphBrief(selectedPersonaGraph);
   return {
     facts: usePersist ? memoriesToFacts(selected) : {},
     memories: selected,
     graphEdges: selectedGraph,
     graphBrief,
     memoryBrief: formatKnowledgeBrief(selected, selectedGraph),
+    personaId: activePersona,
+    personaFacts: usePersist ? memoriesToFacts(selectedPersona) : {},
+    personaMemories: selectedPersona,
+    personaGraphEdges: selectedPersonaGraph,
+    personaGraphBrief,
+    personaMemoryBrief: formatKnowledgeBrief(selectedPersona, selectedPersonaGraph),
     summary: usePersist ? clipText(s.summary || '', summaryBudget) : '',
     history: clipHistory(s.messages, historyBudget),
   };
 }
 
-export function buildGroupContext(chatId, { persist: usePersist = false, query = '', budgetChars = Math.floor(CONTEXT_BUDGET_CHARS * 0.45) } = {}) {
+export function buildGroupContext(chatId, { persist: usePersist = false, query = '', budgetChars = Math.floor(CONTEXT_BUDGET_CHARS * 0.45), personaId = '' } = {}) {
   const s = getGroupSession(chatId, { persist: usePersist });
   const memoryBudget = Math.max(1000, Math.floor(budgetChars * 0.35));
-  const graphBudget = Math.max(450, Math.floor(memoryBudget * 0.45));
-  const factBudget = Math.max(450, memoryBudget - graphBudget);
+  const activePersona = activePersonaId(personaId);
+  const personaBudget = activePersona ? Math.max(420, Math.floor(memoryBudget * 0.3)) : 0;
+  const sharedMemoryBudget = Math.max(580, memoryBudget - personaBudget);
+  const graphBudget = Math.max(300, Math.floor(sharedMemoryBudget * 0.45));
+  const factBudget = Math.max(300, sharedMemoryBudget - graphBudget);
+  const personaGraphBudget = activePersona ? Math.max(160, Math.floor(personaBudget * 0.35)) : 0;
+  const personaFactBudget = activePersona ? Math.max(220, personaBudget - personaGraphBudget) : 0;
   const recentBudget = Math.max(1200, Math.floor(budgetChars * 0.45));
   const summaryBudget = Math.max(500, Math.floor(budgetChars * 0.15));
   const q = query || s.messages.at(-1)?.content || '';
@@ -1046,7 +1240,20 @@ export function buildGroupContext(chatId, { persist: usePersist = false, query =
       budgetChars: graphBudget,
     })
     : [];
+  const selectedPersona = (usePersist && activePersona)
+    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], q, {
+      limit: MEMORY_PERSONA_RELEVANT_LIMIT,
+      budgetChars: personaFactBudget,
+    })
+    : [];
+  const selectedPersonaGraph = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], q, {
+      limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+      budgetChars: personaGraphBudget,
+    })
+    : [];
   const graphBrief = formatGraphBrief(selectedGraph);
+  const personaGraphBrief = formatGraphBrief(selectedPersonaGraph);
   return {
     groupSummary: usePersist ? clipText(s.summary || '', summaryBudget) : '',
     groupFacts: usePersist ? memoriesToFacts(selected) : {},
@@ -1054,16 +1261,23 @@ export function buildGroupContext(chatId, { persist: usePersist = false, query =
     groupGraphEdges: selectedGraph,
     groupGraphBrief: graphBrief,
     groupMemoryBrief: formatKnowledgeBrief(selected, selectedGraph),
+    groupPersonaId: activePersona,
+    groupPersonaFacts: usePersist ? memoriesToFacts(selectedPersona) : {},
+    groupPersonaMemories: selectedPersona,
+    groupPersonaGraphEdges: selectedPersonaGraph,
+    groupPersonaGraphBrief: personaGraphBrief,
+    groupPersonaMemoryBrief: formatKnowledgeBrief(selectedPersona, selectedPersonaGraph),
     groupRecent: clipHistory(s.messages.slice(-12), recentBudget),
   };
 }
 
 // 追加一轮对话。超出短期窗口的旧轮次移入 evicted（待压缩）。
-export function appendTurn(key, userText, assistantText, { persist: usePersist = false } = {}) {
+export function appendTurn(key, userText, assistantText, { persist: usePersist = false, personaId = '' } = {}) {
   if (!userText || !assistantText) return;
   const s = getSession(key, { persist: usePersist });
-  s.messages.push({ role: 'user', content: userText });
-  s.messages.push({ role: 'assistant', content: assistantText });
+  const persona = activePersonaId(personaId);
+  s.messages.push({ role: 'user', content: userText, ...(persona ? { personaId: persona } : {}) });
+  s.messages.push({ role: 'assistant', content: assistantText, ...(persona ? { personaId: persona } : {}) });
   s.turnsSinceExtract += 1;
   const maxMsgs = SHORT_TURNS * 2;
   if (s.messages.length > maxMsgs) {
@@ -1079,25 +1293,29 @@ export function appendTurn(key, userText, assistantText, { persist: usePersist =
   }
 }
 
-export function appendGroupTurn(chatId, { senderName = '', userText = '', assistantText = '', threadContext = '' } = {}, { persist: usePersist = false } = {}) {
+export function appendGroupTurn(chatId, { senderName = '', userText = '', assistantText = '', threadContext = '' } = {}, { persist: usePersist = false, personaId = '' } = {}) {
   if (!chatId || (!userText && !assistantText && !threadContext)) return;
   const s = getGroupSession(chatId, { persist: usePersist });
+  const persona = activePersonaId(personaId);
   if (threadContext) {
     s.messages.push({
       role: 'user',
       content: `【群聊上文】\n${String(threadContext).slice(0, 4000)}`,
+      ...(persona ? { personaId: persona } : {}),
     });
   }
   if (userText) {
     s.messages.push({
       role: 'user',
       content: `${senderName || '某人'}：${userText}`,
+      ...(persona ? { personaId: persona } : {}),
     });
   }
   if (assistantText) {
     s.messages.push({
       role: 'assistant',
       content: `助理：${assistantText}`,
+      ...(persona ? { personaId: persona } : {}),
     });
   }
   s.turnsSinceExtract += 1;
@@ -1129,19 +1347,33 @@ async function doMaintainMemory(key) {
     const snapshot = s.messages.slice();
     const scope = desc.chatType === 'group' ? 'group_user' : 'p2p';
     const provenance = makeProvenance({ sourceSessionId: desc.id, snapshot });
+    const personaId = personaIdFromTurns(snapshot);
     const extracted = await extractKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
     const { facts, edges } = splitExtractedKnowledge(extracted, { scope, provenance });
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope, source: 'llm', provenance }));
-    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
+    const incomingMemories = factsToMemoryItems(facts, { scope, source: 'llm', provenance });
+    const splitMemories = splitPersonaScopedMemories(incomingMemories, { personaId, baseScope: scope });
+    const splitEdges = splitPersonaScopedGraphEdges(edges, { personaId, baseScope: scope });
+    s.memories = mergeMemories(s.memories || [], splitMemories.shared);
+    s.personaMemories = mergePersonaMemories(s.personaMemories || {}, personaId, splitMemories.persona, { baseScope: scope });
+    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], splitEdges.shared) };
+    s.personaGraph = mergePersonaGraph(s.personaGraph || {}, personaId, splitEdges.persona, { baseScope: scope });
     changed = true;
   }
   const before = (s.memories || []).length;
   const beforeGraph = (s.graph?.edges || []).length;
+  const beforePersona = JSON.stringify(s.personaMemories || {}).length;
+  const beforePersonaGraph = JSON.stringify(s.personaGraph || {}).length;
   s.memories = pruneMemories(s.memories || []);
   s.graph = graphToPersist(s.graph);
+  s.personaMemories = prunePersonaMemories(s.personaMemories || {});
+  s.personaGraph = normalizePersonaGraph(personaGraphToPersist(s.personaGraph || {}), {
+    scope: desc.chatType === 'group' ? 'group_user' : 'p2p',
+  });
   s.facts = memoriesToFacts(s.memories);
   if (s.memories.length !== before) changed = true;
   if ((s.graph?.edges || []).length !== beforeGraph) changed = true;
+  if (JSON.stringify(s.personaMemories || {}).length !== beforePersona) changed = true;
+  if (JSON.stringify(s.personaGraph || {}).length !== beforePersonaGraph) changed = true;
   if (changed) persist(s.desc, s);
 }
 
@@ -1161,19 +1393,31 @@ async function doMaintainGroupMemory(chatId) {
     const snapshot = s.messages.slice(-Math.min(s.messages.length, SHORT_TURNS * 2));
     s.summary = await updateGroupSummary(s.summary, snapshot);
     const provenance = makeProvenance({ sourceSessionId: `group:${s.chatId}`, snapshot });
+    const personaId = personaIdFromTurns(snapshot);
     const extracted = await extractGroupKeyMemory(s.facts, snapshot, graphForPrompt(s.graph));
     const { facts, edges } = splitExtractedKnowledge(extracted, { scope: 'group', provenance });
-    s.memories = mergeMemories(s.memories || [], factsToMemoryItems(facts, { scope: 'group', source: 'llm', provenance }));
-    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], edges) };
+    const incomingMemories = factsToMemoryItems(facts, { scope: 'group', source: 'llm', provenance });
+    const splitMemories = splitPersonaScopedMemories(incomingMemories, { personaId, baseScope: 'group' });
+    const splitEdges = splitPersonaScopedGraphEdges(edges, { personaId, baseScope: 'group' });
+    s.memories = mergeMemories(s.memories || [], splitMemories.shared);
+    s.personaMemories = mergePersonaMemories(s.personaMemories || {}, personaId, splitMemories.persona, { baseScope: 'group' });
+    s.graph = { edges: mergeGraphEdges(s.graph?.edges || [], splitEdges.shared) };
+    s.personaGraph = mergePersonaGraph(s.personaGraph || {}, personaId, splitEdges.persona, { baseScope: 'group' });
     changed = true;
   }
   const before = (s.memories || []).length;
   const beforeGraph = (s.graph?.edges || []).length;
+  const beforePersona = JSON.stringify(s.personaMemories || {}).length;
+  const beforePersonaGraph = JSON.stringify(s.personaGraph || {}).length;
   s.memories = pruneMemories(s.memories || []);
   s.graph = graphToPersist(s.graph);
+  s.personaMemories = prunePersonaMemories(s.personaMemories || {});
+  s.personaGraph = normalizePersonaGraph(personaGraphToPersist(s.personaGraph || {}), { scope: 'group' });
   s.facts = memoriesToFacts(s.memories);
   if (s.memories.length !== before) changed = true;
   if ((s.graph?.edges || []).length !== beforeGraph) changed = true;
+  if (JSON.stringify(s.personaMemories || {}).length !== beforePersona) changed = true;
+  if (JSON.stringify(s.personaGraph || {}).length !== beforePersonaGraph) changed = true;
   if (changed) persistGroup(s.chatId, s);
 }
 
@@ -1220,6 +1464,10 @@ export const __testing = Object.freeze({
   mergeGraphEdges,
   normalizeMemoryItems,
   normalizeGraphEdges,
+  normalizePersonaMemories,
+  normalizePersonaGraph,
+  splitPersonaScopedMemories,
+  splitPersonaScopedGraphEdges,
   selectRelevantMemories,
   selectRelevantGraphEdges,
 });

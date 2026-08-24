@@ -580,7 +580,7 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
 
   // 正常 Agent 处理；注入 registerPendingWrite 让写操作可登记待确认
   let registeredAction = null;
-  const personaDecision = resolvePersonaForMessage(text, {
+  const personaDecision = ctx.personaDecision || resolvePersonaForMessage(text, {
     chatId: ctx.chatId || '',
     personaState: stateStore.getPersonaState(),
   });
@@ -610,10 +610,15 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   return {
     text: answer,
     approvalAction: registeredAction && answer === registeredAction.preview ? registeredAction : null,
+    personaDecision,
   };
 }
 
 async function runGroupAgentForMessage({ text, chatId, messageId, senderId, senderName, senderProfile, isOwner, threadContext = '' }) {
+  const personaDecision = resolvePersonaForMessage(text, {
+    chatId,
+    personaState: stateStore.getPersonaState(),
+  });
   const gKey = sessionKey({
     chatType: 'group',
     chatId,
@@ -622,8 +627,8 @@ async function runGroupAgentForMessage({ text, chatId, messageId, senderId, send
     senderDept: senderProfile?.department || '',
     senderEmail: senderProfile?.email || '',
   });
-  const gCtx = buildContext(gKey, { persist: true, query: text });
-  const sharedGroupCtx = buildGroupContext(chatId, { persist: true, query: text });
+  const gCtx = buildContext(gKey, { persist: true, query: text, personaId: personaDecision.personaId });
+  const sharedGroupCtx = buildGroupContext(chatId, { persist: true, query: text, personaId: personaDecision.personaId });
   const response = await runAgentWithConfirm(text, {
     isOwner,
     senderId,
@@ -632,11 +637,12 @@ async function runGroupAgentForMessage({ text, chatId, messageId, senderId, send
     chatId,
     messageId,
     ownerConfirmationKey: OWNER_OPEN_ID ? `g:${chatId}:${OWNER_OPEN_ID}` : '',
+    personaDecision,
     ...gCtx,
     ...sharedGroupCtx,
     threadContext,
   }, gKey.id, isOwner);
-  return { response, gKey };
+  return { response, gKey, personaDecision };
 }
 
 // 处理单条消息事件
@@ -756,7 +762,7 @@ async function handleEvent(evt) {
       if (recent.error) console.warn(`[context] 群聊上下文预取失败 ${messageId}: ${recent.error}`);
       else threadContext = recent.text || '';
     }
-    const { response, gKey } = await runGroupAgentForMessage({
+    const { response, gKey, personaDecision } = await runGroupAgentForMessage({
       text: qText,
       chatId: d.chat_id,
       messageId,
@@ -776,8 +782,8 @@ async function handleEvent(evt) {
       return;
     }
     activity = setGroupActivity(d.chat_id, noteGroupBotMessage(activity));
-    appendTurn(gKey, qText, answer, { persist: true });
-    appendGroupTurn(d.chat_id, { senderName, userText: qText, assistantText: answer, threadContext }, { persist: true });
+    appendTurn(gKey, qText, answer, { persist: true, personaId: personaDecision?.personaId });
+    appendGroupTurn(d.chat_id, { senderName, userText: qText, assistantText: answer, threadContext }, { persist: true, personaId: personaDecision?.personaId });
     maintainMemory(gKey).catch((e) => console.error('[memory] 维护异常：', e.message)); // 异步，不阻塞
     maintainGroupMemory(d.chat_id).catch((e) => console.error('[memory] 群共享记忆维护异常：', e.message));
     return;
@@ -805,7 +811,11 @@ async function handleEvent(evt) {
   }
   // 统一交给 Agent 编排（私聊无群上下文，查群成员/群消息类工具会提示不可用；查人等仍可用）
   const pKey = sessionKey({ chatType, chatId: d.chat_id, senderId, senderName, senderDept: senderProfile?.department || '', senderEmail: senderProfile?.email || '' });
-  const pCtx = buildContext(pKey, { persist: true, query: renderedRawText }); // 主人与访客均持久化三层记忆
+  const personaDecision = resolvePersonaForMessage(renderedRawText, {
+    chatId: '',
+    personaState: stateStore.getPersonaState(),
+  });
+  const pCtx = buildContext(pKey, { persist: true, query: renderedRawText, personaId: personaDecision.personaId }); // 主人与访客均持久化三层记忆
   const response = await runAgentWithConfirm(renderedRawText, {
       isOwner,
       senderId,
@@ -813,6 +823,7 @@ async function handleEvent(evt) {
       senderDept: senderProfile?.department || '',
       chatId: '',
       ownerConfirmationKey: OWNER_OPEN_ID ? `p:${OWNER_OPEN_ID}` : '',
+      personaDecision,
       ...pCtx,
   }, pKey.id, isOwner);
   const answer = response.text;
@@ -821,7 +832,7 @@ async function handleEvent(evt) {
     forgetHandled(messageId);
     return;
   }
-  appendTurn(pKey, renderedRawText, answer, { persist: true });
+  appendTurn(pKey, renderedRawText, answer, { persist: true, personaId: response.personaDecision?.personaId || personaDecision.personaId });
   maintainMemory(pKey).catch((e) => console.error('[memory] 维护异常：', e.message)); // 异步，不阻塞
 }
 

@@ -14,7 +14,7 @@
    ├─ runAgent（agent.mjs）：轻量状态图运行时（ReAct：reason→act→guard→observe→converge）
    │     ├─ Policy Engine（policy.mjs）：身份/数据级别/副作用/信息流强制门禁
    │     └─ 工具集（tools.mjs）：一等工具 + 主人专属元工具
-   ├─ 人格系统（persona.mjs）：默认人格 + 学术人格 + 自动临时切换 + 主人持久切换
+   ├─ 人格系统（persona.mjs）：自动人格模式 + 固定人格 + 主人确认后持久切换
    ├─ 有界事件队列 + 单实例重连 + lark-cli 超时
    ├─ 记忆系统（memory.mjs）：短期 + 摘要 + facts/memories + 轻量图谱（串行维护、原子落盘）
    └─ 会话绑定的写操作二次确认（交互卡片按钮 + 确认码兜底）
@@ -33,7 +33,7 @@
 | [src/approval.mjs](src/approval.mjs) | 会话绑定的写审批状态机，防跨群/模糊确认/动作错位 |
 | [src/lark.mjs](src/lark.mjs) | 统一 lark-cli 执行器：超时、输出上限、进程回收 |
 | [src/models.mjs](src/models.mjs) | 多模型注册表：能力档案、任务路由、运行时切换、请求体裁剪 |
-| [src/memory.mjs](src/memory.mjs) | 三层对话记忆，按用户分目录持久化 |
+| [src/memory.mjs](src/memory.mjs) | 三层对话记忆 + 共享/人格专属记忆，按用户分目录持久化 |
 | [test/](test/) | Node 内置测试：权限、Agent、SSRF、超时、记忆、多模型回归 |
 | [docker/shell-sandbox.Dockerfile](docker/shell-sandbox.Dockerfile) | Shell Docker runner 的默认镜像，内置 Node/npm、Python3、git、ripgrep 等受限工具 |
 | `.local/skills/feishu-skill/` | 本地 lark-cli 技能包目录（被 `.gitignore` 忽略，不随开源代码上传）；仅作为 `lark-cli skills` 不可用时的离线回退 |
@@ -127,6 +127,7 @@
 | 短期（最近 30 轮原文） | 默认仅内存（重启清空）；`MEMORY_PERSIST_SHORT=on` 时原子落盘、重启恢复 | 每轮实时 |
 | 长期摘要 | 原子落盘（0600） | 有旧对话滑出窗口时增量压缩 |
 | 结构化长期记忆（memories[]，兼容 facts） | 原子落盘（0600） | 每 5 轮抽取、相关性检索、TTL/过期清理 |
+| 人格专属记忆（personaMemories / personaGraph） | 与场景 JSON 同文件，按 personaId 分桶 | 当前人格下的回答风格、推理习惯、输出结构等，不污染共享事实 |
 | 轻量知识图谱（graph.edges） | 原子落盘（0600），与场景 JSON 同文件 | 每 5 轮抽取三元组，按实体关系 1~2 跳召回 |
 
 持久化按用户分目录，便于人工查看/修改：
@@ -134,16 +135,16 @@
 ```
 data/memory/<用户名>_<openid短码>/
   ├── profile.json          身份：姓名/部门/邮箱/openId
-  ├── p2p.json              私聊记忆：{summary, facts, memories, graph[, messages]}
+  ├── p2p.json              私聊记忆：{summary, facts, memories, graph, personaMemories, personaGraph[, messages]}
   └── group_<chatId>.json   该用户在该群里的场景记忆
 
 data/memory/groups/
-  └── group_<chatId>.json   群共享记忆：群主线、公开协作背景、成员角色、群风格、关系图谱等
+  └── group_<chatId>.json   群共享记忆：群主线、公开协作背景、成员角色、群风格、关系图谱、人格专属群偏好等
 ```
 
 主人与访客均享完整三层记忆并落盘，各自按 `sessionKey` 严格隔离（互不串）。
 群聊场景额外维护一份群共享记忆，并在机器人被 @ 时按 `GROUP_CONTEXT_PREFETCH` 自动预取最近群聊上文，帮助 bot 自然接话，而不是只依赖模型临时决定是否读取上下文。
-构造 prompt 时不会全量注入长期记忆：系统会按当前问题做相关性筛选，并用 `MEMORY_CONTEXT_BUDGET_CHARS` 控制 summary/history/memories/graph 的总量；图谱会先命中当前问题相关实体，再带出相邻关系边；临时任务、决策类记忆会按 TTL 自动过期，长期未命中的非耐久记忆会被清理。
+构造 prompt 时不会全量注入长期记忆：系统会按当前问题做相关性筛选，并用 `MEMORY_CONTEXT_BUDGET_CHARS` 控制 summary/history/memories/graph 的总量；图谱会先命中当前问题相关实体，再带出相邻关系边；临时任务、决策类记忆会按 TTL 自动过期，长期未命中的非耐久记忆会被清理。人格系统采用 shared memory + persona-scoped memory：项目事实、成员关系、群背景等进入共享记忆，所有人格可用；回答风格、学术推理习惯、输出结构等进入当前人格专属记忆，只在该人格激活时注入。
 短期落盘（`MEMORY_PERSIST_SHORT=on`）会把最近原文写入场景文件的 `messages` 字段，重启后仍受 TTL 约束——超过 `MEMORY_TTL_MS` 未活动的旧短期不恢复，避免捞回很久以前的对话。
 
 ## 前置条件
@@ -199,7 +200,7 @@ tail -f /tmp/larkbot.log
 | `MEMORY_EXTRACT_EVERY` | 记忆 | 每几轮抽取关键记忆，默认 5 |
 | `MEMORY_PERSIST_SHORT` | 记忆 | `on` 时短期原文也落盘、重启恢复（受 TTL 约束）；默认 `off`（仅内存） |
 | `MEMORY_TTL_MS` | 记忆 | 短期无活动过期时长，默认 30 分钟 |
-| `MEMORY_CONTEXT_BUDGET_CHARS` / `MEMORY_RELEVANT_LIMIT` | 记忆 | prompt 记忆上下文预算与每轮最多注入的相关长期记忆条数 |
+| `MEMORY_CONTEXT_BUDGET_CHARS` / `MEMORY_RELEVANT_LIMIT` / `MEMORY_PERSONA_RELEVANT_LIMIT` | 记忆 | prompt 记忆上下文预算 / 每轮最多注入的共享长期记忆条数 / 每轮最多注入的人格专属记忆条数 |
 | `MEMORY_TEMP_TTL_MS` / `MEMORY_TASK_TTL_MS` / `MEMORY_DECISION_TTL_MS` / `MEMORY_STALE_MS` | 记忆 | 临时、任务、决策、长期未使用记忆的遗忘策略 |
 | `GROUP_CONTEXT_PREFETCH` / `GROUP_CONTEXT_LIMIT` / `GROUP_CONTEXT_INCLUDE_IMAGES` | 群聊 | 群聊 @ 时是否预取最近上文、读取条数、是否识别前文图片；图片识别默认 `on` |
 | `GROUP_AUTO_PARTICIPATE` / `GROUP_AUTO_MODE` / `GROUP_AUTO_COOLDOWN_MS` / `GROUP_AUTO_MAX_PER_HOUR` / `GROUP_AUTO_MIN_MESSAGES_SINCE_BOT` | 群聊 | 是否允许未 @ 自动参与（默认 `off`）/ 活跃度档位 `conservative|normal|chatty`（默认 `normal`）/ 自动接话冷却 / 每小时最多主动回复次数 / 距离上次 bot 发言至少多少条群消息 |
