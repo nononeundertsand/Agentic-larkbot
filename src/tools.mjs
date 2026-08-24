@@ -21,6 +21,7 @@ import { describeImage, listModelIds, setRuntimeDefaultModel, currentDefaultMode
 import { formatLarkFailureForTool } from './lark-errors.mjs';
 import { getOwnerName, getOwnerOpenId } from './owner.mjs';
 import { makeSafetyRefusal } from './safety-response.mjs';
+import { AUTO_PERSONA_ID, getPersona, listPersonaOptions, normalizePersonaSetting, personaConfig } from './persona.mjs';
 import {
   GENERIC_TOOL_OUTPUT_SCHEMA,
   errorToolEnvelope,
@@ -82,6 +83,17 @@ function safeSkillRef(value) {
   if (!ref.startsWith('references/') && !ref.endsWith('SKILL.md')) ref = `references/${ref}`;
   if (!ref.endsWith('.md')) ref += '.md';
   return ref;
+}
+
+function chatPersonaIdFromState(state = {}, chatId = '') {
+  const entry = chatId ? state?.chatPersonas?.[chatId] : null;
+  if (!entry) return '';
+  return typeof entry === 'string' ? entry : String(entry.personaId || '');
+}
+
+function personaOptionLabel(id) {
+  if (id === AUTO_PERSONA_ID) return '自动人格';
+  return getPersona(id).name;
 }
 
 async function readEmbeddedSkill(skill, refPath = '') {
@@ -1562,6 +1574,127 @@ const TOOLS = [
       return executeShellCommand(review.action, { review });
     },
   },
+
+  // ============ 人格管理（仅主人）：查看/切换长期人格 ============
+  {
+    name: 'list_personas',
+    description:
+      '列出机器人内置人格、当前会话/群聊持久人格、全局默认人格和自动人格切换状态。' +
+      '用于"有哪些人格""现在是什么人格""这个群的人格是什么"。',
+    parameters: { type: 'object', properties: {}, required: [] },
+    run(_args, ctx) {
+      const state = ctx.stateStore?.getPersonaState?.() || {};
+      const config = personaConfig(process.env);
+      const chatPersonaId = normalizePersonaSetting(chatPersonaIdFromState(state, ctx.chatId || ''));
+      const globalPersonaId = normalizePersonaSetting(state.defaultPersonaId) || config.defaultPersonaId;
+      return {
+        options: listPersonaOptions(),
+        current: {
+          personaId: ctx.personaDecision?.personaId || chatPersonaId || globalPersonaId,
+          source: ctx.personaDecision?.source || (chatPersonaId ? 'chat_persistent' : 'global_or_env_default'),
+          answerMode: ctx.personaDecision?.answerMode || '',
+        },
+        persistent: {
+          globalDefault: globalPersonaId,
+          currentChat: chatPersonaId || '',
+        },
+        autoSwitch: config.autoSwitch,
+      };
+    },
+  },
+
+  {
+    name: 'switch_persona',
+    description:
+      '切换机器人长期使用的人格（仅主人可用，需确认卡片或确认码确认后生效）。' +
+      'scope=current_chat 表示只修改当前群聊；scope=global 表示修改全局默认人格。' +
+      '用于"这个群以后用学术人格""全局改成日常人格""切换成 academic_serious""切换到自动人格"。',
+    parameters: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', description: '目标人格 id 或别名，如 auto、daily_assistant、academic_serious、自动、日常、学术' },
+        scope: { type: 'string', enum: ['current_chat', 'global'], description: '切换范围；群聊默认 current_chat，私聊默认 global' },
+      },
+      required: ['persona_id'],
+    },
+    ownerOnly: true,
+    run({ persona_id, scope }, ctx) {
+      const id = normalizePersonaSetting(persona_id);
+      if (!id) {
+        return {
+          error: `未知人格「${persona_id}」`,
+          available: listPersonaOptions().map((persona) => ({ id: persona.id, name: persona.name, aliases: persona.aliases })),
+        };
+      }
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.setDefaultPersonaId || !stateStore?.setChatPersonaId) {
+        return { error: '运行态状态存储不可用，无法登记人格设置' };
+      }
+      const targetScope = scope || (ctx.chatId ? 'current_chat' : 'global');
+      const updatedBy = ctx.senderName || ctx.senderId || 'owner';
+      const scopeText = targetScope === 'current_chat' ? '当前群聊' : '全局默认';
+      const label = personaOptionLabel(id);
+      const preview = [
+        '将切换机器人长期人格设置：',
+        `范围：${scopeText}`,
+        `目标：${label}（${id}）`,
+        id === AUTO_PERSONA_ID
+          ? '说明：自动人格会按每轮问题选择人格；数学、证明、论文、算法等专业问题会临时使用认真严肃学术人格。'
+          : '说明：固定人格会持续使用该人格，不再被自动专业问题路由覆盖。',
+      ].join('\n');
+      const result = confirmSingleAction(
+        ctx,
+        {
+          executor: 'persona',
+          persona: {
+            personaId: id,
+            scope: targetScope,
+            chatId: ctx.chatId || '',
+            updatedBy,
+          },
+        },
+        preview,
+        'switch_persona',
+      );
+      return {
+        ...result,
+        message: result.message,
+        target: { personaId: id, label, scope: targetScope },
+      };
+    },
+  },
+
+  {
+    name: 'clear_chat_persona',
+    description:
+      '清除当前群聊的持久人格设置，使其回落到全局默认人格/自动人格模式（仅主人可用，需确认）。' +
+      '用于"清除这个群的人格设置""当前群恢复全局人格"。',
+    parameters: { type: 'object', properties: {}, required: [] },
+    ownerOnly: true,
+    run(_args, ctx) {
+      if (!ctx.chatId) return { error: '当前不是群聊，没有可清除的群人格设置。' };
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.clearChatPersonaId) return { error: '运行态状态存储不可用，无法登记人格设置' };
+      return confirmSingleAction(
+        ctx,
+        {
+          executor: 'persona',
+          persona: {
+            personaId: '',
+            scope: 'clear_current_chat',
+            chatId: ctx.chatId,
+            updatedBy: ctx.senderName || ctx.senderId || 'owner',
+          },
+        },
+        [
+          '将清除当前群聊的持久人格设置。',
+          '清除后，本群会回落到全局默认人格或自动人格模式。',
+        ].join('\n'),
+        'clear_chat_persona',
+      );
+    },
+  },
+
 
   // ============ 模型管理（仅主人）：查看/切换当前默认模型 ============
   {

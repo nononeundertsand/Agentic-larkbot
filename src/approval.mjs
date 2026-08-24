@@ -25,6 +25,8 @@ export class ApprovalStore {
       : { executor: 'lark', ...action };
     if (normalized.executor === 'shell' || normalized.executor === 'sandbox_shell') {
       if (!normalized.shell?.command) throw new Error('待确认 Shell 操作缺少命令');
+    } else if (normalized.executor === 'persona') {
+      if (!normalized.persona || typeof normalized.persona !== 'object') throw new Error('待确认人格操作缺少配置');
     } else if (!Array.isArray(normalized?.args) || normalized.args.length === 0) {
       throw new Error('待确认写操作缺少命令参数');
     }

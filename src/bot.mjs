@@ -44,6 +44,7 @@ import { getOwnerName, getOwnerOpenId, initOwnerIdentity, isOwnerSender, maskId 
 import { containsLarkAtTag, larkAtTag, postContentFromTextWithMentions } from './lark-format.mjs';
 import { splitReplyText } from './reply-parts.mjs';
 import { formatSafetyRefusal } from './safety-response.mjs';
+import { AUTO_PERSONA_ID, getPersona, normalizePersonaSetting, resolvePersonaForMessage } from './persona.mjs';
 import {
   executeApprovedSandboxShellAction,
   executeApprovedShellAction,
@@ -398,9 +399,39 @@ async function executePendingApproval(pending) {
     const r = await executeApprovedSandboxShellAction(pending.shell);
     return formatSandboxShellResultForUser(pending, r);
   }
+  if (pending.executor === 'persona') {
+    return executePersonaApproval(pending.persona || {});
+  }
   const r = await runLark(pending.args);
   if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
   return formatLarkSuccessForUser(pending, r);
+}
+
+function personaSettingName(personaId = '') {
+  const id = String(personaId || '').trim();
+  if (id === AUTO_PERSONA_ID) return '自动人格';
+  return getPersona(id).name;
+}
+
+function executePersonaApproval(persona = {}) {
+  const scope = String(persona.scope || '');
+  const personaId = normalizePersonaSetting(persona.personaId);
+  if (scope === 'clear_current_chat') {
+    if (!persona.chatId) return '执行失败：缺少群聊 ID，无法清除当前群人格设置。';
+    const state = stateStore.clearChatPersonaId(persona.chatId);
+    if (!state) return '执行失败：人格设置未保存。';
+    return '已清除当前群聊的持久人格设置，后续会回落到全局默认人格或自动人格模式。';
+  }
+  if (!personaId) return '执行失败：缺少目标人格。';
+  if (scope === 'current_chat') {
+    if (!persona.chatId) return '执行失败：缺少群聊 ID，无法切换当前群人格。';
+    const state = stateStore.setChatPersonaId(persona.chatId, personaId, { updatedBy: persona.updatedBy || 'owner' });
+    if (!state) return '执行失败：人格设置未保存。';
+    return `已将当前群长期人格切换为「${personaSettingName(personaId)}」。`;
+  }
+  const state = stateStore.setDefaultPersonaId(personaId, { updatedBy: persona.updatedBy || 'owner' });
+  if (!state) return '执行失败：人格设置未保存。';
+  return `已将全局默认人格切换为「${personaSettingName(personaId)}」。`;
 }
 
 async function replyAgentResponse(messageId, response, { chatId = '' } = {}) {
@@ -549,12 +580,31 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
 
   // 正常 Agent 处理；注入 registerPendingWrite 让写操作可登记待确认
   let registeredAction = null;
+  const personaDecision = resolvePersonaForMessage(text, {
+    chatId: ctx.chatId || '',
+    personaState: stateStore.getPersonaState(),
+  });
+  const personaScopeKey = ctx.chatId ? `chat:${ctx.chatId}` : `p2p:${ctx.senderId || confirmationKey || 'unknown'}`;
+  stateStore.recordPersonaSelection({
+    scopeKey: personaScopeKey,
+    personaId: personaDecision.personaId,
+    source: personaDecision.source,
+    reason: personaDecision.reason,
+    answerMode: personaDecision.answerMode,
+  });
+  if (personaDecision.source === 'auto') {
+    console.log(`[persona] 本轮自动切换为 ${personaDecision.personaId} reason=${personaDecision.reason}`);
+  }
   const agentCtx = {
     ...ctx,
+    stateStore,
+    personaDecision,
+    personaId: personaDecision.personaId,
+    answerMode: personaDecision.answerMode,
     confirmedWrite: false,
-      registerPendingWrite: (action) => {
-        registeredAction = approvals.register(action?.confirmationKey || confirmationKey, action);
-      },
+    registerPendingWrite: (action) => {
+      registeredAction = approvals.register(action?.confirmationKey || confirmationKey, action);
+    },
   };
   const answer = await runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
   return {

@@ -120,7 +120,7 @@ function envDefaultModelId() {
 }
 
 // 任务 → 模型 id 的路由表（B）。未配置回落默认模型。
-// 支持的任务名：chat / vision / fast / reasoning / summary / extract / safety / intent
+// 常用任务名：chat / vision / fast / reasoning / academic / summary / extract / safety / intent
 function routeModelId(task) {
   const envKey = `LLM_ROUTE_${String(task || '').toUpperCase()}`;
   const routed = process.env[envKey];

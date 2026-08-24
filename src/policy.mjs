@@ -46,6 +46,9 @@ const TOOL_POLICIES = Object.freeze({
   // 运行时切换默认模型：仅主人，改运行时状态视为写（但无飞书副作用，故不走二次确认）。
   switch_model: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
   list_models: { ownerOnly: true, dataClass: 'system', outputTrust: 'trusted' },
+  switch_persona: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
+  list_personas: { ownerOnly: true, dataClass: 'system', outputTrust: 'trusted' },
+  clear_chat_persona: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
   start_user_auth: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
 
   // 元工具能力面过大，只允许主人使用；命令本身再做正向只读分类。

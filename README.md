@@ -14,6 +14,7 @@
    ├─ runAgent（agent.mjs）：轻量状态图运行时（ReAct：reason→act→guard→observe→converge）
    │     ├─ Policy Engine（policy.mjs）：身份/数据级别/副作用/信息流强制门禁
    │     └─ 工具集（tools.mjs）：一等工具 + 主人专属元工具
+   ├─ 人格系统（persona.mjs）：默认人格 + 学术人格 + 自动临时切换 + 主人持久切换
    ├─ 有界事件队列 + 单实例重连 + lark-cli 超时
    ├─ 记忆系统（memory.mjs）：短期 + 摘要 + facts/memories + 轻量图谱（串行维护、原子落盘）
    └─ 会话绑定的写操作二次确认（交互卡片按钮 + 确认码兜底）
@@ -28,6 +29,7 @@
 | [src/reply.mjs](src/reply.mjs) | LLM 调用、prompt 片段、安全评估、防注入、旧编排循环（`runAgentLegacy` 回滚用） |
 | [src/tools.mjs](src/tools.mjs) | 工具注册表（一等工具 + 元工具）+ 权限门禁 |
 | [src/policy.mjs](src/policy.mjs) | 中央能力策略：工具权限、数据敏感度、副作用、信息流控制 |
+| [src/persona.mjs](src/persona.mjs) | 人格注册表、自动路由、人格 prompt 生成 |
 | [src/approval.mjs](src/approval.mjs) | 会话绑定的写审批状态机，防跨群/模糊确认/动作错位 |
 | [src/lark.mjs](src/lark.mjs) | 统一 lark-cli 执行器：超时、输出上限、进程回收 |
 | [src/models.mjs](src/models.mjs) | 多模型注册表：能力档案、任务路由、运行时切换、请求体裁剪 |
@@ -82,6 +84,13 @@
 - **配置切换 + 能力档案**：`.env` 用 `LLM_MODELS` 定义多个模型，各自声明是否支持自定义 temperature / tools / vision / max_tokens 字段名；调用时按档案裁剪请求体，从根上规避「模型不支持某参数」的 400（GPT-5 系列必需）。
 - **任务路由**：识图走多模态模型、安全/意图/记忆抽取走快模型、群聊主推理走强模型（`LLM_ROUTE_*`）。
 - **运行时切换**：主人在飞书里说「换成 gpt-5」即时生效（`switch_model` / `list_models` 工具，仅主人，进程重启回落 `.env`）。
+
+**人格系统**：机器人有可扩展的人格注册表，当前可选：
+- `auto`：自动人格模式，按每轮问题临时选择合适人格。
+- `daily_assistant`：默认日常助理人格，适合普通问答、群聊接话和飞书事务。
+- `academic_serious`：认真严肃学术人格，适合数学、证明、论文、算法和工程原理问题；会优先抽取核心命题，给出定义、推理、结论和待验证点。
+
+默认使用 `auto`：当群友消息命中数学符号、定理/猜想、证明/证伪、论文、算法等信号时，只对本轮回复临时切到 `academic_serious`；普通问题使用 `daily_assistant`。主人可以通过 `list_personas` 查看人格，通过 `switch_persona` 把当前群或全局默认设置切换为 `auto` 或某个固定人格，也可用 `clear_chat_persona` 清除当前群覆盖。切换人格属于长期配置变更，会弹出确认卡片，确认后才生效；访客不能查看或修改人格配置。人格只影响表达和推理策略，不能改变主人/访客权限、安全策略、数据边界或工具限制。
 
 > **提示**：日历/任务/邮件工具走 `--as user`，需主人先给对应 scope 授权（如日程查看/创建/删除分别需要 `calendar:calendar.event:read`、`calendar:calendar.event:create`、`calendar:calendar.event:delete`）。未授权时工具会**如实返回授权错误**并转达给你，绝不编造结果。
 
@@ -183,8 +192,9 @@ tail -f /tmp/larkbot.log
 | `LLM_BASE_URL` / `LLM_API_URL` | openai | 接口地址 |
 | `LLM_MAX_RETRIES` / `LLM_FALLBACK_MODEL` | LLM | 429/5xx 最大重试（默认 2）/ 备用模型 |
 | `LLM_MODELS` | 多模型 | 模型能力档案 JSON 数组（temperature/tools/vision/maxTokensField/maxTokens/extraBody）；`extraBody` 可透传 Gemini thinking 等参数 |
-| `LLM_ROUTE_VISION` / `LLM_ROUTE_FAST` / `LLM_ROUTE_REASONING` | 多模型 | 任务路由：不同任务走不同模型；未配置回落默认模型 |
+| `LLM_ROUTE_VISION` / `LLM_ROUTE_FAST` / `LLM_ROUTE_REASONING` / `LLM_ROUTE_ACADEMIC` | 多模型 | 任务路由：不同任务走不同模型；学术人格可单独路由到强推理模型；未配置回落默认模型 |
 | `OWNER_OPEN_ID` / `OWNER_NAME` / `OWNER_AUTO_DISCOVER` | 通用 | 主人身份；推荐显式配置 `OWNER_OPEN_ID`。为空时默认尝试从 `lark-cli` 当前 user 登录态自动发现，可设 `OWNER_AUTO_DISCOVER=off` 关闭 |
+| `PERSONA_DEFAULT` / `PERSONA_AUTO_SWITCH` / `PERSONA_ACADEMIC_THRESHOLD` | 人格 | 默认人格设置（默认 `auto`，也可设 `daily_assistant` / `academic_serious` 固定人格）/ 是否允许自动人格路由（默认 `on`）/ 学术人格触发阈值（默认 4） |
 | `MEMORY_SHORT_TURNS` | 记忆 | 短期窗口轮数，默认 30 |
 | `MEMORY_EXTRACT_EVERY` | 记忆 | 每几轮抽取关键记忆，默认 5 |
 | `MEMORY_PERSIST_SHORT` | 记忆 | `on` 时短期原文也落盘、重启恢复（受 TTL 约束）；默认 `off`（仅内存） |

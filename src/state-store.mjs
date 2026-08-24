@@ -24,6 +24,13 @@ function defaultData() {
     toolCalls: [],
     memoryJobs: [],
     workflows: {},
+    persona: {
+      defaultPersonaId: '',
+      defaultUpdatedAt: '',
+      defaultUpdatedBy: '',
+      chatPersonas: {},
+      lastSelections: {},
+    },
     updatedAt: new Date().toISOString(),
   };
 }
@@ -41,6 +48,49 @@ function atomicWriteJson(file, data) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
   renameSync(tmp, file);
+}
+
+function normalizePersonaEntry(entry) {
+  if (!entry) return null;
+  if (typeof entry === 'string') {
+    const personaId = entry.trim();
+    return personaId ? { personaId, updatedAt: '', updatedBy: '' } : null;
+  }
+  if (typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const personaId = String(entry.personaId || '').trim();
+  if (!personaId) return null;
+  return {
+    personaId,
+    updatedAt: String(entry.updatedAt || ''),
+    updatedBy: String(entry.updatedBy || ''),
+  };
+}
+
+function normalizePersonaState(input = {}) {
+  const state = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const chatPersonas = {};
+  for (const [chatId, entry] of Object.entries(state.chatPersonas || {})) {
+    const normalized = normalizePersonaEntry(entry);
+    if (String(chatId || '').trim() && normalized) chatPersonas[chatId] = normalized;
+  }
+  const lastSelections = {};
+  for (const [key, entry] of Object.entries(state.lastSelections || {})) {
+    if (!String(key || '').trim() || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    lastSelections[key] = {
+      personaId: String(entry.personaId || ''),
+      source: String(entry.source || ''),
+      reason: String(entry.reason || ''),
+      answerMode: String(entry.answerMode || ''),
+      selectedAt: String(entry.selectedAt || ''),
+    };
+  }
+  return {
+    defaultPersonaId: String(state.defaultPersonaId || ''),
+    defaultUpdatedAt: String(state.defaultUpdatedAt || ''),
+    defaultUpdatedBy: String(state.defaultUpdatedBy || ''),
+    chatPersonas,
+    lastSelections,
+  };
 }
 
 export class RuntimeStateStore {
@@ -79,6 +129,7 @@ export class RuntimeStateStore {
         agentRuns: Array.isArray(data.agentRuns) ? data.agentRuns : [],
         toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls : [],
         memoryJobs: Array.isArray(data.memoryJobs) ? data.memoryJobs : [],
+        persona: normalizePersonaState(data.persona),
         workflows: data.workflows && typeof data.workflows === 'object' && !Array.isArray(data.workflows)
           ? Object.fromEntries(Object.entries(data.workflows).map(([id, workflow]) => {
             const normalized = normalizeWorkflow({ workflowId: id, ...workflow });
@@ -290,5 +341,61 @@ export class RuntimeStateStore {
       .slice(0, this.maxWorkflows);
     this.data.workflows = Object.fromEntries(entries);
     if (save) this.save();
+  }
+
+  getPersonaState() {
+    this.data.persona = normalizePersonaState(this.data.persona);
+    return safeClone(this.data.persona);
+  }
+
+  setDefaultPersonaId(personaId, { updatedBy = '' } = {}) {
+    const id = String(personaId || '').trim();
+    if (!id || !this.enabled) return null;
+    this.data.persona = normalizePersonaState(this.data.persona);
+    this.data.persona.defaultPersonaId = id;
+    this.data.persona.defaultUpdatedAt = new Date().toISOString();
+    this.data.persona.defaultUpdatedBy = String(updatedBy || '');
+    this.save();
+    return this.getPersonaState();
+  }
+
+  setChatPersonaId(chatId, personaId, { updatedBy = '' } = {}) {
+    const key = String(chatId || '').trim();
+    const id = String(personaId || '').trim();
+    if (!key || !id || !this.enabled) return null;
+    this.data.persona = normalizePersonaState(this.data.persona);
+    this.data.persona.chatPersonas[key] = {
+      personaId: id,
+      updatedAt: new Date().toISOString(),
+      updatedBy: String(updatedBy || ''),
+    };
+    this.save();
+    return this.getPersonaState();
+  }
+
+  clearChatPersonaId(chatId) {
+    const key = String(chatId || '').trim();
+    if (!key || !this.enabled) return null;
+    this.data.persona = normalizePersonaState(this.data.persona);
+    delete this.data.persona.chatPersonas[key];
+    this.save();
+    return this.getPersonaState();
+  }
+
+  recordPersonaSelection({ scopeKey = '', chatId = '', personaId = '', source = '', reason = '', answerMode = '' } = {}) {
+    if (!this.enabled) return false;
+    const key = String(scopeKey || (chatId ? `chat:${chatId}` : 'global')).trim();
+    const id = String(personaId || '').trim();
+    if (!key || !id) return false;
+    this.data.persona = normalizePersonaState(this.data.persona);
+    this.data.persona.lastSelections[key] = {
+      personaId: id,
+      source: String(source || ''),
+      reason: String(reason || ''),
+      answerMode: String(answerMode || ''),
+      selectedAt: new Date().toISOString(),
+    };
+    this.save();
+    return true;
   }
 }

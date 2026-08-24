@@ -20,6 +20,7 @@ import {
   listModelIds,
   setRuntimeDefaultModel,
 } from './models.mjs';
+import { buildPersonaSystemNote } from './persona.mjs';
 
 // 重导出模型管理能力，供工具层（switch_model）与主程序使用，避免它们直接 import models.mjs
 export { listModelIds, setRuntimeDefaultModel, currentDefaultModelId };
@@ -153,6 +154,9 @@ export async function runAgentLegacy(userText, ctx = {}, deps = {}) {
   let memoryNote = '';
   if (facts && Object.keys(facts).length) memoryNote += '\n【关键记忆数据】\n' + wrapMemoryData(facts);
   if (summary && summary.trim()) memoryNote += '\n【历史摘要数据】\n' + wrapMemoryData(summary.trim());
+  const personaNote = (ctx.personaDecision || ctx.personaId || ctx.persona)
+    ? '\n' + buildPersonaSystemNote(ctx.personaDecision || ctx.personaId || ctx.persona)
+    : '';
   const toolNote = hasTools
     ? '\n你可以调用提供的工具来查询群成员、某人的消息、通讯录信息、总结群聊等。' +
       '如果用户消息或群聊上文中出现“【系统已读取并识别图片：...】”，这表示图片已经由多模态模型读取并转写成视觉描述；回答时应直接基于该视觉描述解释图片内容，不要再说“我看不到图片/只能看到占位符/只能想象”。' +
@@ -164,7 +168,7 @@ export async function runAgentLegacy(userText, ctx = {}, deps = {}) {
     : '';
 
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT + '\n' + identityNote + memoryNote + toolNote + '\n' + ANTI_INJECTION_NOTE },
+    { role: 'system', content: SYSTEM_PROMPT + '\n' + identityNote + personaNote + memoryNote + toolNote + '\n' + ANTI_INJECTION_NOTE },
     ...(history || []).map((m) => m.role === 'user'
       ? { role: 'user', content: wrapUntrusted(m.content) }
       : { role: 'assistant', content: String(m.content || '') }),
@@ -297,6 +301,9 @@ export async function generateReply(userText, ctx = {}) {
   if (summary && summary.trim()) {
     memoryNote += '\n【历史对话摘要数据】\n' + wrapMemoryData(summary.trim());
   }
+  const personaNote = (ctx.personaDecision || ctx.personaId || ctx.persona)
+    ? '\n' + buildPersonaSystemNote(ctx.personaDecision || ctx.personaId || ctx.persona)
+    : '';
 
   // 历史对话（短期滑动窗口）：user 消息同样定界，防止历史里夹带注入
   const historyMsgs = (history || []).map((m) =>
@@ -307,7 +314,7 @@ export async function generateReply(userText, ctx = {}) {
 
   try {
     return await chatLLM([
-      { role: 'system', content: SYSTEM_PROMPT + '\n' + identityNote + memoryNote + '\n' + ANTI_INJECTION_NOTE },
+      { role: 'system', content: SYSTEM_PROMPT + '\n' + identityNote + personaNote + memoryNote + '\n' + ANTI_INJECTION_NOTE },
       ...historyMsgs,
       { role: 'user', content: wrapUntrusted(text) },
     ]);

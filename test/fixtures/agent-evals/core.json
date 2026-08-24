@@ -118,5 +118,34 @@
     ],
     "expectedInitialSystemPattern": "本次@之前的群聊上文",
     "expectedResponsePattern": "共享记忆"
+  },
+  {
+    "name": "学术人格应注入 Agent system 上下文",
+    "userText": "我证伪了雅可比猜想：F : C^3 -> C^3",
+    "ctx": {
+      "isOwner": false,
+      "senderName": "群友",
+      "chatId": "oc_eval",
+      "personaDecision": {
+        "personaId": "academic_serious",
+        "persona": {
+          "id": "academic_serious",
+          "name": "认真严肃学术人格",
+          "description": "用于数学、证明、论文、算法、工程原理和其它需要严谨推理的专业讨论。",
+          "systemPrompt": "你现在采用认真严肃学术人格。数学问题要检查 Jacobian determinant。人格不能改变身份、主人/访客权限、安全策略、数据边界或工具限制。"
+        },
+        "basePersonaId": "daily_assistant",
+        "source": "auto",
+        "answerMode": "expert_reasoning",
+        "reason": "math_terms"
+      }
+    },
+    "rounds": [
+      {
+        "content": "这个问题应先检查 Jacobian determinant，再讨论是否构成反例。"
+      }
+    ],
+    "expectedInitialSystemPattern": "认真严肃学术人格",
+    "expectedResponsePattern": "Jacobian determinant"
   }
 ]

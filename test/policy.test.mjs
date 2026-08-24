@@ -41,9 +41,14 @@ test('长尾 lark-cli 域默认使用正确身份', () => {
 test('访客看不到且不能执行主人专属工具和元工具', async () => {
   assert.equal(authorizeTool('run_lark_cli', {}, { isOwner: false }).ok, false);
   assert.equal(authorizeTool('start_user_auth', {}, { isOwner: false }).ok, false);
+  assert.equal(authorizeTool('switch_persona', {}, { isOwner: false }).ok, false);
+  assert.equal(authorizeTool('clear_chat_persona', {}, { isOwner: false }).ok, false);
   const names = getToolSchemas({ isOwner: false }).map((item) => item.function.name);
   assert.equal(names.includes('run_lark_cli'), false);
   assert.equal(names.includes('start_user_auth'), false);
+  assert.equal(names.includes('switch_persona'), false);
+  assert.equal(names.includes('list_personas'), false);
+  assert.equal(names.includes('clear_chat_persona'), false);
   assert.equal(names.includes('mail_triage'), false);
   assert.equal(names.includes('web_search'), true);
 
@@ -60,6 +65,52 @@ test('访客看不到且不能执行主人专属工具和元工具', async () =>
 test('主人可见授权卡片工具', () => {
   const names = getToolSchemas({ isOwner: true }).map((item) => item.function.name);
   assert.equal(names.includes('start_user_auth'), true);
+  assert.equal(names.includes('list_personas'), true);
+  assert.equal(names.includes('switch_persona'), true);
+  assert.equal(names.includes('clear_chat_persona'), true);
+});
+
+test('主人可查看人格选项，包含自动人格和固定人格', async () => {
+  const result = await executeTool('list_personas', {}, {
+    isOwner: true,
+    chatId: 'oc_math',
+    stateStore: {
+      getPersonaState: () => ({ defaultPersonaId: 'auto', chatPersonas: {} }),
+    },
+  });
+  const ids = result.options.map((item) => item.id);
+  assert.ok(ids.includes('auto'));
+  assert.ok(ids.includes('daily_assistant'));
+  assert.ok(ids.includes('academic_serious'));
+  assert.equal(result.persistent.globalDefault, 'auto');
+});
+
+test('主人切换人格会登记待确认动作', async () => {
+  let pending;
+  const stateStore = {
+    getPersonaState: () => ({ defaultPersonaId: 'daily_assistant', chatPersonas: {} }),
+    setDefaultPersonaId: () => null,
+    setChatPersonaId: () => null,
+  };
+  const result = await executeTool('switch_persona', {
+    persona_id: '自动',
+    scope: 'current_chat',
+  }, {
+    isOwner: true,
+    chatId: 'oc_math',
+    senderName: '主人',
+    stateStore,
+    registerPendingWrite: (action) => { pending = action; },
+  });
+  assert.equal(result.needConfirm, true);
+  assert.equal(pending.executor, 'persona');
+  assert.equal(pending.toolName, 'switch_persona');
+  assert.deepEqual(pending.persona, {
+    personaId: 'auto',
+    scope: 'current_chat',
+    chatId: 'oc_math',
+    updatedBy: '主人',
+  });
 });
 
 test('calendar_delete 固定使用 user 身份并进入二次确认', async () => {

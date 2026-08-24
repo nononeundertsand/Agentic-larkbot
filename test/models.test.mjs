@@ -13,6 +13,7 @@ process.env.LLM_MODELS = JSON.stringify([
 ]);
 process.env.LLM_ROUTE_FAST = 'fast-mini';
 process.env.LLM_ROUTE_VISION = 'gpt-5.6-sol';
+process.env.LLM_ROUTE_ACADEMIC = 'gpt-5.6-sol';
 
 const {
   getProfile, buildRequestBody, resolveModelChain,
@@ -67,6 +68,7 @@ test('模型档案可透传默认 maxTokens 和 extraBody thinking', () => {
 test('任务路由：vision/fast 指到指定模型，未配置回落默认', () => {
   assert.equal(resolveModelChain({ task: 'vision' })[0], 'gpt-5.6-sol');
   assert.equal(resolveModelChain({ task: 'fast' })[0], 'fast-mini');
+  assert.equal(resolveModelChain({ task: 'academic' })[0], 'gpt-5.6-sol');
   assert.equal(resolveModelChain({ task: 'chat' })[0], currentDefaultModelId());
 });
 

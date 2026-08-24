@@ -24,6 +24,7 @@
 - 交互确认：文本确认码 + 飞书确认/取消卡片
 - 本地状态层：事件幂等、审批恢复、workflow 持久区基础版
 - 记忆系统：用户记忆、群共享记忆、知识图谱、冲突治理
+- 人格系统：自动人格模式、默认人格、认真严肃学术人格、主人确认后持久切换
 - 评估基础：Node test + 对话级 eval fixtures
 
 ## 实施状态
@@ -61,6 +62,12 @@
 - `workflow-planner`
   - 把用户自然语言目标转成结构化计划。
   - 输出 `workflowType`、`steps[]`、`requiredInputs`、`riskLevel`。
+
+- `persona-router`
+  - 在进入复杂任务规划前判断本轮应使用的回答人格。
+  - 当前支持 `auto`、`daily_assistant` 与 `academic_serious`。
+  - 设置为 `auto` 时，学术/数学/证明类问题可先进入学术人格做严谨分析；后续可升级为 `academic_review` / `proof_check` workflow。
+  - 人格只影响推理风格和输出结构，不改变权限、安全策略或工具可用性。
 
 - `workflow-runner`
   - 按步骤执行 workflow。

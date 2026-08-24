@@ -72,6 +72,22 @@ test('审批状态机支持访客沙箱 Shell executor 动作', () => {
   assert.equal(result.action.shell.sandboxMode, 'apt_install');
 });
 
+test('审批状态机支持人格配置 executor 动作', () => {
+  const store = new ApprovalStore({ ttlMs: 10000 });
+  store.register('g:group:owner', {
+    id: 'p1',
+    toolName: 'switch_persona',
+    executor: 'persona',
+    persona: { personaId: 'auto', scope: 'current_chat', chatId: 'oc_math' },
+    preview: '切换人格',
+    confirmToken: 'PER001',
+  });
+  const result = store.resolve('g:group:owner', '确认 PER001', { isOwner: true });
+  assert.equal(result.kind, 'execute');
+  assert.equal(result.action.executor, 'persona');
+  assert.equal(result.action.persona.personaId, 'auto');
+});
+
 test('运行状态持久化：事件幂等可跨实例恢复', () => {
   const dir = mkdtempSync(join(tmpdir(), 'larkbot-state-events-'));
   const file = join(dir, 'state.json');
@@ -115,6 +131,35 @@ test('运行状态持久化：待确认审批可跨实例恢复并在确认后�
 
     const afterConfirm = new ApprovalStore({ ttlMs: 10000, stateStore: new RuntimeStateStore({ file }) });
     assert.equal(afterConfirm.resolve('p:owner', '确认 TASK1', { isOwner: true }).kind, 'none');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('运行状态持久化：人格设置可保存并跨实例恢复', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-state-persona-'));
+  const file = join(dir, 'state.json');
+  try {
+    const first = new RuntimeStateStore({ file });
+    first.setDefaultPersonaId('auto', { updatedBy: 'owner' });
+    first.setChatPersonaId('oc_math', 'academic_serious', { updatedBy: 'owner' });
+    first.recordPersonaSelection({
+      scopeKey: 'chat:oc_math',
+      personaId: 'academic_serious',
+      source: 'auto',
+      reason: 'math_terms',
+      answerMode: 'expert_reasoning',
+    });
+
+    const restored = new RuntimeStateStore({ file });
+    const state = restored.getPersonaState();
+    assert.equal(state.defaultPersonaId, 'auto');
+    assert.equal(state.chatPersonas.oc_math.personaId, 'academic_serious');
+    assert.equal(state.lastSelections['chat:oc_math'].answerMode, 'expert_reasoning');
+
+    restored.clearChatPersonaId('oc_math');
+    const afterClear = new RuntimeStateStore({ file }).getPersonaState();
+    assert.equal(afterClear.chatPersonas.oc_math, undefined);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
