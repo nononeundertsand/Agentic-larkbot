@@ -34,6 +34,9 @@
 | [src/lark.mjs](src/lark.mjs) | 统一 lark-cli 执行器：超时、输出上限、进程回收 |
 | [src/models.mjs](src/models.mjs) | 多模型注册表：能力档案、任务路由、运行时切换、请求体裁剪 |
 | [src/memory.mjs](src/memory.mjs) | 三层对话记忆 + 共享/人格专属记忆，按用户分目录持久化 |
+| [src/workflow-schema.mjs](src/workflow-schema.mjs) | Workflow v2 schema：步骤、artifact、citation、progress event 与状态转换 |
+| [src/workflow-runner.mjs](src/workflow-runner.mjs) | Durable workflow runner：顺序推进、确认暂停、恢复、取消、重试 |
+| [src/workflow-control.mjs](src/workflow-control.mjs) | Workflow 与现有审批卡片/确认码通道的适配层 |
 | [test/](test/) | Node 内置测试：权限、Agent、SSRF、超时、记忆、多模型回归 |
 | [docker/shell-sandbox.Dockerfile](docker/shell-sandbox.Dockerfile) | Shell Docker runner 的默认镜像，内置 Node/npm、Python3、git、ripgrep 等受限工具 |
 | `.local/skills/feishu-skill/` | 本地 lark-cli 技能包目录（被 `.gitignore` 忽略，不随开源代码上传）；仅作为 `lark-cli skills` 不可用时的离线回退 |
@@ -89,8 +92,11 @@
 - `auto`：自动人格模式，按每轮问题临时选择合适人格。
 - `daily_assistant`：默认日常助理人格，适合普通问答、群聊接话和飞书事务。
 - `academic_serious`：认真严肃学术人格，适合数学、证明、论文、算法和工程原理问题；会优先抽取核心命题，给出定义、推理、结论和待验证点。
+- `cute_catgirl_style`：可爱猫娘风格，适合香香软软、会撒娇卖萌、关心体贴、带轻微暧昧和含蓄撩人感的轻松群聊和日常协作；仍保持工具、安全和专业任务的可靠边界。旧 ID `catgirl_assistant` 会作为别名兼容。
 
 默认使用 `auto`：当群友消息命中数学符号、定理/猜想、证明/证伪、论文、算法等信号时，只对本轮回复临时切到 `academic_serious`；普通问题使用 `daily_assistant`。主人可以通过 `list_personas` 查看人格，通过 `switch_persona` 把当前群或全局默认设置切换为 `auto` 或某个固定人格，也可用 `clear_chat_persona` 清除当前群覆盖。切换人格属于长期配置变更，会弹出确认卡片，确认后才生效；访客不能查看或修改人格配置。人格只影响表达和推理策略，不能改变主人/访客权限、安全策略、数据边界或工具限制。
+
+**Workflow 基础能力**：复杂任务可先落成 durable workflow，再由 runner 按步骤推进。当前已提供主人专属 `start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry` 工具，用于验证计划落盘、确认暂停、确认后恢复、取消和失败重试。workflow 确认复用现有确认卡片/确认码通道；文档总结、会议安排、数据分析等业务 worker 会在后续迭代接入。
 
 > **提示**：日历/任务/邮件工具走 `--as user`，需主人先给对应 scope 授权（如日程查看/创建/删除分别需要 `calendar:calendar.event:read`、`calendar:calendar.event:create`、`calendar:calendar.event:delete`）。未授权时工具会**如实返回授权错误**并转达给你，绝不编造结果。
 
@@ -195,7 +201,7 @@ tail -f /tmp/larkbot.log
 | `LLM_MODELS` | 多模型 | 模型能力档案 JSON 数组（temperature/tools/vision/maxTokensField/maxTokens/extraBody）；`extraBody` 可透传 Gemini thinking 等参数 |
 | `LLM_ROUTE_VISION` / `LLM_ROUTE_FAST` / `LLM_ROUTE_REASONING` / `LLM_ROUTE_ACADEMIC` | 多模型 | 任务路由：不同任务走不同模型；学术人格可单独路由到强推理模型；未配置回落默认模型 |
 | `OWNER_OPEN_ID` / `OWNER_NAME` / `OWNER_AUTO_DISCOVER` | 通用 | 主人身份；推荐显式配置 `OWNER_OPEN_ID`。为空时默认尝试从 `lark-cli` 当前 user 登录态自动发现，可设 `OWNER_AUTO_DISCOVER=off` 关闭 |
-| `PERSONA_DEFAULT` / `PERSONA_AUTO_SWITCH` / `PERSONA_ACADEMIC_THRESHOLD` | 人格 | 默认人格设置（默认 `auto`，也可设 `daily_assistant` / `academic_serious` 固定人格）/ 是否允许自动人格路由（默认 `on`）/ 学术人格触发阈值（默认 4） |
+| `PERSONA_DEFAULT` / `PERSONA_AUTO_SWITCH` / `PERSONA_ACADEMIC_THRESHOLD` | 人格 | 默认人格设置（默认 `auto`，也可设 `daily_assistant` / `academic_serious` / `cute_catgirl_style` 固定人格）/ 是否允许自动人格路由（默认 `on`）/ 学术人格触发阈值（默认 4） |
 | `MEMORY_SHORT_TURNS` | 记忆 | 短期窗口轮数，默认 30 |
 | `MEMORY_EXTRACT_EVERY` | 记忆 | 每几轮抽取关键记忆，默认 5 |
 | `MEMORY_PERSIST_SHORT` | 记忆 | `on` 时短期原文也落盘、重启恢复（受 TTL 约束）；默认 `off`（仅内存） |

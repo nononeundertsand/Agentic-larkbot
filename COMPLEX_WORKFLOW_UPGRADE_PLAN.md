@@ -24,8 +24,8 @@
 - 交互确认：文本确认码 + 飞书确认/取消卡片
 - 本地状态层：事件幂等、审批恢复、workflow 持久区基础版
 - 记忆系统：用户记忆、群共享记忆、知识图谱、冲突治理
-- 人格系统：自动人格模式、默认人格、认真严肃学术人格、主人确认后持久切换
-  - 记忆采用 shared memory + persona-scoped memory：复杂任务事实共享，学术推理习惯和输出结构按人格分桶
+- 人格系统：自动人格模式、默认人格、认真严肃学术人格、可爱猫娘风格、主人确认后持久切换
+  - 记忆采用 shared memory + persona-scoped memory：复杂任务事实共享，学术推理习惯、猫娘风格规则和输出结构按人格分桶
 - 评估基础：Node test + 对话级 eval fixtures
 
 ## 实施状态
@@ -37,14 +37,21 @@
   - 定义 workflow 状态转换、取消、重试语义
   - `RuntimeStateStore` 保存和加载 workflow 时会规范化为 v2
   - 已补充 `test/workflow-schema.test.mjs`
+- W1 Workflow Runner MVP：基础版已完成。
+  - 新增 `src/workflow-runner.mjs`
+  - 新增 `src/workflow-control.mjs`
+  - Runner 支持 `plan/tool/transform/verify/confirm/send` 步骤推进、progress event、artifact/citation 合并、失败重试和取消
+  - workflow 确认已接入现有 `ApprovalStore` 和确认卡片/确认码通道，确认后可通过 runner 继续执行，取消会标记 workflow 为 `canceled`
+  - 新增主人专属工具：`start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry`
+  - 已补充 `test/workflow-runner.test.mjs` 和 `test/workflow-tools.test.mjs`
 
 核心短板：
 
 - 还没有稳定的任务规划器，不会把复杂目标拆成可恢复步骤。
-- workflow 状态只是基础存储，还没有真正接入 Agent 执行循环。
-- 还没有 artifact / citation / report 这类交付物模型。
-- 长任务没有后台队列、取消、进度更新、失败重试。
-- 复杂任务仍依赖单轮 LLM 自主循环，容易预算耗尽、上下文污染或中断后丢失。
+- workflow 已有 Runner 和主人专属工具入口，但还没有接入具体业务 workflow 的真实 worker。
+- artifact / citation 已有 JSON 模型和 Runner 合并能力，但还没有文件型 artifact store 和报告生成规范。
+- 长任务还没有后台队列、超时策略和跨 workflow 并发管理；取消/重试目前是基础工具能力。
+- 文档、会议、数据分析等复杂任务仍未从单轮 LLM 自主循环迁移到业务 workflow。
 
 ## 设计原则
 
@@ -66,7 +73,7 @@
 
 - `persona-router`
   - 在进入复杂任务规划前判断本轮应使用的回答人格。
-  - 当前支持 `auto`、`daily_assistant` 与 `academic_serious`。
+  - 当前支持 `auto`、`daily_assistant`、`academic_serious` 与 `cute_catgirl_style`。
   - 设置为 `auto` 时，学术/数学/证明类问题可先进入学术人格做严谨分析；后续可升级为 `academic_review` / `proof_check` workflow。
   - 人格只影响推理风格和输出结构，不改变权限、安全策略或工具可用性。
 
@@ -163,6 +170,16 @@
 
 目标：让机器人能创建一个真实 workflow，并按步骤推进，不再只是单轮 Agent 自主循环。
 
+状态：基础版已完成，业务 worker 尚未接入。
+
+落地情况：
+
+- `src/workflow-runner.mjs` 可顺序执行 workflow steps，并在每步写入 progress event。
+- `confirm` step 会暂停为 `waiting_confirmation`，生成 `resumeToken`，确认后继续执行后续步骤。
+- `src/workflow-control.mjs` 将 workflow 确认适配为现有审批 action。
+- `bot.mjs` 已支持 `executor: workflow` 的卡片/确认码执行与取消。
+- `tools.mjs` 新增主人专属 workflow 管理工具，支持创建、查询、取消和重试。
+
 任务：
 
 - 新增 `workflow-runner`。
@@ -194,6 +211,11 @@
 - 能执行一个 fake workflow：plan -> tool -> transform -> confirm -> complete。
 - 进程重启后能从 `waiting_confirmation` 恢复。
 - 失败步骤能记录错误并允许重试。
+
+已覆盖测试：
+
+- `test/workflow-runner.test.mjs`
+- `test/workflow-tools.test.mjs`
 
 ### W2 文档总结工作流 MVP
 
@@ -427,9 +449,9 @@
 
 ## 推荐实施顺序
 
-1. W0：workflow v2 schema 和 artifact/citation 设计。
-2. W1：workflow-runner MVP，打通状态推进和确认恢复。
-3. W2：文档总结工作流 MVP。
+1. W0：workflow v2 schema 和 artifact/citation 设计。（已完成）
+2. W1：workflow-runner MVP，打通状态推进和确认恢复。（基础版已完成）
+3. W2：文档总结工作流 MVP。（下一步）
 4. W3：会议安排工作流。
 5. W5：数据分析工作流。
 6. W4：资料回顾工作流。
@@ -458,6 +480,8 @@
 - 支持 fake steps。
 - 接入 `RuntimeStateStore`。
 - 支持 `waiting_confirmation` 恢复。
+
+状态：已完成基础版，并已通过主人专属 workflow 工具接入 Agent 工具体系。
 
 ### MVP-3 文档链接识别与读取
 

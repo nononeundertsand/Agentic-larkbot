@@ -50,6 +50,10 @@ const TOOL_POLICIES = Object.freeze({
   list_personas: { ownerOnly: true, dataClass: 'system', outputTrust: 'trusted' },
   clear_chat_persona: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
   start_user_auth: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
+  start_workflow: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
+  workflow_status: { ownerOnly: true, dataClass: 'system', outputTrust: 'trusted' },
+  workflow_cancel: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
+  workflow_retry: { ownerOnly: true, effect: 'write', dataClass: 'system', outputTrust: 'trusted' },
 
   // 元工具能力面过大，只允许主人使用；命令本身再做正向只读分类。
   run_lark_cli: { ownerOnly: true, dataClass: 'private', outputTrust: 'private' },

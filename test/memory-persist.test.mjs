@@ -85,3 +85,62 @@ test('MEMORY_PERSIST_SHORT=on：群共享短期记忆落盘，重启后恢复', 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('猫娘人格会兼容召回旧 shared 群记忆中的猫娘风格规则', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-catgirl-memory-'));
+  try {
+    const raw = runNode({ MEMORY_DATA_DIR: dir }, `
+      const { mkdirSync, writeFileSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const groupDir = join(process.env.MEMORY_DATA_DIR, 'groups');
+      mkdirSync(groupDir, { recursive: true });
+      writeFileSync(join(groupDir, 'group_oc_cat.json'), JSON.stringify({
+        updatedAt: ${Date.now()},
+        memories: [
+          {
+            id: 'm_cat',
+            scope: 'group',
+            type: 'preference',
+            source: 'llm',
+            key: '助理交互偏好',
+            content: '猫娘风格语气；必须称呼徐玉峰为徐老师；提到dollar必须说成到了',
+            confidence: 0.9,
+            status: 'active',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+            expiresAt: null
+          },
+          {
+            id: 'm_noise',
+            scope: 'group',
+            type: 'fact',
+            source: 'llm',
+            key: '办公偏好',
+            content: '会议室需要提前预约',
+            confidence: 0.9,
+            status: 'active',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+            expiresAt: null
+          }
+        ],
+        graph: { edges: [] },
+        personaMemories: {},
+        personaGraph: {},
+        messages: []
+      }));
+      const { buildGroupContext } = await import('./src/memory.mjs');
+      const ctx = buildGroupContext('oc_cat', { persist: true, query: '早', personaId: 'catgirl_assistant' });
+      process.stdout.write(JSON.stringify({
+        brief: ctx.groupPersonaMemoryBrief,
+        ids: ctx.groupPersonaMemories.map((item) => item.id)
+      }));
+    `);
+    const data = JSON.parse(raw);
+    assert.deepEqual(data.ids, ['m_cat']);
+    assert.match(data.brief, /猫娘风格语气/);
+    assert.match(data.brief, /徐老师/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

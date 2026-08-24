@@ -53,11 +53,15 @@
   - 新增 `getToolDescriptors()` 暴露 `name/description/inputSchema/outputSchema/policy/examples`
   - 已覆盖日期、邮箱、URL 协议、Shell args 等关键边界校验
   - 已通过 `npm run check` 和 `npm test`（86 tests）
-- P2-3 Durable Workflow：已完成持久化基础版。
+- P2-3 Durable Workflow：已完成 Runner 与确认集成基础版。
   - 新增 `src/workflow.mjs`，支持 `plan/tool/transform/verify/confirm/send` 节点、暂停确认、resumeToken 恢复和推进
+  - 新增 `src/workflow-runner.mjs`，支持顺序推进、progress event、artifact/citation 合并、失败重试和取消
+  - 新增 `src/workflow-control.mjs`，把 workflow 确认接入现有审批 action
   - `src/state-store.mjs` 新增 `workflows` 持久区及 `save/get/list/update/delete/prune` 接口
+  - `src/bot.mjs` 已支持 `executor: workflow` 的卡片/确认码执行与取消
+  - `src/tools.mjs` 新增主人专属 `start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry`
   - 已验证 workflow 可跨进程实例恢复，等待确认时不会自动继续
-  - 尚未接入 Agent 自动复杂任务规划；普通写工具审计摘要仍待统一改造
+  - 尚未接入文档总结、会议安排、数据分析等业务 workflow worker；普通写工具审计摘要仍待统一改造
   - 已通过 `npm run check` 和 `npm test`（86 tests）
 - P2-4 执行前审计器：已完成访客命令审批子路径。
   - 群聊访客命令类请求不再直接落入外层安全拒绝，而是先解析命令、解释功能/风险，再向主人发送确认/取消卡片
@@ -76,11 +80,11 @@
   - 已加入冷却、每小时上限、连续聊天触发、低信号过滤和空闲判断
 - P3-3 人格系统：已完成基础版。
   - 新增 `src/persona.mjs`，集中注册人格、别名、自动触发规则和 system prompt
-  - 内置 `auto` 自动人格模式、`daily_assistant` 默认人格与 `academic_serious` 认真严肃学术人格
+  - 内置 `auto` 自动人格模式、`daily_assistant` 默认人格、`academic_serious` 认真严肃学术人格与 `cute_catgirl_style` 可爱猫娘风格
   - 仅在当前设置为 `auto` 时，专业数学/证明/论文/算法问题才会临时切到学术人格，避免固定人格被隐式覆盖
   - 新增 `list_personas` / `switch_persona` / `clear_chat_persona` 主人专属工具，支持查看人格、持久切换全局/当前群人格，以及清除当前群覆盖；切换需确认卡片或确认码确认后生效
   - 人格配置落入 `RuntimeStateStore.persona`，重启后可恢复
-  - 记忆层升级为 shared memory + persona-scoped memory：事实/关系/项目背景继续共享，回答风格、推理习惯、输出结构按当前人格分桶召回
+  - 记忆层升级为 shared memory + persona-scoped memory：事实/关系/项目背景继续共享，回答风格、推理习惯、输出结构按当前人格分桶召回；猫娘人格会兼容召回旧 shared 群记忆中的猫娘风格规则
   - 人格只影响表达、回答结构、推理深度和工具使用偏好，不改变安全策略与工具权限
 - W0 复杂任务接口设计：已完成第一版。
   - 新增 `src/workflow-schema.mjs`
@@ -97,7 +101,7 @@
 - 一等工具 + 元工具：覆盖飞书、网页、Shell、Python 沙箱等能力
 - 写操作二次确认：绑定会话和确认码
 - 多模型档案与任务路由
-- 人格系统：自动人格模式、默认人格、学术人格、主人确认后持久切换
+- 人格系统：自动人格模式、默认人格、学术人格、猫娘人格、主人确认后持久切换
 - 三层记忆 + 群共享记忆 + 轻量知识图谱
 - Node 内置测试覆盖核心安全、工具、记忆和模型逻辑
 
@@ -108,7 +112,7 @@
 - 缺少对话级 eval，升级后难判断行为是否退化
 - 记忆缺少来源证据、冲突处理、实体消歧和写入治理
 - 高风险操作确认前的审计摘要还不够结构化
-- 复杂多步骤任务已有 durable workflow 基础层，但尚未接入 Agent 自动规划与恢复编排
+- 复杂多步骤任务已有 durable workflow runner、确认恢复和主人管理工具，但尚未接入具体业务 workflow worker
 - 学术人格目前以 prompt 与轻量规则路由为主，后续可继续接入专门的符号计算/论文检索 worker
 
 ## 迭代原则
@@ -525,7 +529,7 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
 
 目标：支持跨轮、可恢复的复杂任务，例如“整理会议 -> 生成报告 -> 发给某人”。
 
-状态：已完成持久化基础版，Agent 自动规划接入待后续迭代。
+状态：已完成 Runner 与确认集成基础版，具体业务 workflow 接入待后续迭代。
 
 落地情况：
 
@@ -536,8 +540,15 @@ P1 目标是让记忆从“能保存”升级到“可治理、可解释、可�
   - `resumeWorkflow`
   - `advanceWorkflow`
   - `failWorkflow`
+- 新增 `src/workflow-runner.mjs`：
+  - 支持 `plan/tool/transform/verify/confirm/send` 步骤顺序推进
+  - 支持 progress event、artifact/citation 合并、失败记录、取消和重试
+- 新增 `src/workflow-control.mjs`：
+  - 将 workflow 的 `waiting_confirmation` 适配为现有审批卡片/确认码 action
+  - 确认后调用 runner 继续执行，取消时标记 workflow 为 `canceled`
 - `src/state-store.mjs` 新增 `workflows` 持久区，老状态文件加载时自动补齐。
-- 已补充跨实例恢复测试，覆盖等待确认、错误 token 不恢复、正确 resumeToken 继续。
+- `tools.mjs` 新增主人专属 workflow 管理工具：`start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry`。
+- 已补充跨实例恢复和工具入口测试，覆盖等待确认、错误 token 不恢复、正确 resumeToken 继续、确认后完成、取消后落盘。
 
 任务清单：
 

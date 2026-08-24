@@ -37,6 +37,14 @@ import {
   shellApprovalPreview,
   shellEnabled,
 } from './shell.mjs';
+import {
+  buildWorkflowApprovalAction,
+  createRuntimeWorkflowRunner,
+  createWorkflowFromRequest,
+  formatWorkflowForUser,
+  formatWorkflowRunResult,
+  workflowSummary,
+} from './workflow-control.mjs';
 
 // feishu-skill 文档根目录：默认放在本地忽略目录 .local/skills/feishu-skill，可用 FEISHU_SKILL_ROOT 覆盖。
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -461,12 +469,37 @@ const MARKDOWN_IMAGE_TEST_RE = /!\[Image\]\((img_[^) \t\r\n]+)\)/i;
 const IMAGE_GENERIC_RE = /\[Image\]/gi;
 const IMAGE_GENERIC_TEST_RE = /\[Image\]/i;
 const RAW_IMAGE_KEY_RE = /\bimg_[A-Za-z0-9_:-]+\b/g;
+const IMAGE_DESCRIPTION_CACHE_MAX = Math.max(20, Number(process.env.IMAGE_DESCRIPTION_CACHE_MAX || 500));
+const imageDescriptionCache = new Map();
 
 function detectImageMime(buf) {
   if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
   if (buf.slice(0, 3).toString('ascii') === 'GIF') return 'image/gif';
   return 'image/jpeg';
+}
+
+function imageDescriptionCacheKey(messageId, fileKey) {
+  return `${String(messageId || '')}:${String(fileKey || '')}`;
+}
+
+function getCachedImageDescription(messageId, fileKey) {
+  const key = imageDescriptionCacheKey(messageId, fileKey);
+  if (!imageDescriptionCache.has(key)) return '';
+  const value = imageDescriptionCache.get(key);
+  imageDescriptionCache.delete(key);
+  imageDescriptionCache.set(key, value);
+  return value;
+}
+
+function rememberImageDescription(messageId, fileKey, description) {
+  const text = String(description || '').trim();
+  if (!text) return;
+  const key = imageDescriptionCacheKey(messageId, fileKey);
+  imageDescriptionCache.set(key, text);
+  while (imageDescriptionCache.size > IMAGE_DESCRIPTION_CACHE_MAX) {
+    imageDescriptionCache.delete(imageDescriptionCache.keys().next().value);
+  }
 }
 
 function parseJsonMaybe(value) {
@@ -501,6 +534,41 @@ function collectImageKeys(value, out = new Set()) {
 
 function extractImageKeysFromContent(content) {
   return [...collectImageKeys(content)];
+}
+
+function collectTextFragments(value, out = []) {
+  if (value == null) return out;
+  if (typeof value === 'string') {
+    const parsed = parseJsonMaybe(value);
+    if (parsed) return collectTextFragments(parsed, out);
+    const text = value.replace(/\s+/g, ' ').trim();
+    if (text && !/^img_[A-Za-z0-9_:-]+$/.test(text)) out.push(text);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTextFragments(item, out);
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (['image_key', 'file_key'].includes(key)) continue;
+      if (['text', 'plain_text', 'content', 'title'].includes(key)) collectTextFragments(item, out);
+      else if (typeof item === 'object') collectTextFragments(item, out);
+    }
+  }
+  return out;
+}
+
+function messageContentRawText(content) {
+  if (typeof content === 'string') return content;
+  try { return JSON.stringify(content); } catch { return String(content || ''); }
+}
+
+function messageReadableText(content) {
+  return collectTextFragments(content)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function looksLikeImageOnlyPlaceholder(content) {
@@ -548,7 +616,7 @@ async function describeMessageImage(messageId, fileKey) {
       '--type', 'image',
       '--output', outputRel,
       '--as', 'bot',
-    ]);
+    ], { cwd: PROJECT_ROOT });
     if (r.code !== 0 || !existsSync(output)) {
       console.warn(`[image] 下载失败 message=${messageId} key=${fileKey} code=${r.code}: ${(r.err || r.out || '').slice(0, 300)}`);
       return '';
@@ -562,32 +630,42 @@ async function describeMessageImage(messageId, fileKey) {
   }
 }
 
-export async function renderMessageContent(message, imageBudget = { remaining: 0 }) {
-  const raw = String(message.content || '');
-  const normalized = raw.replace(/\s+/g, ' ').trim();
-  let imageKeys = extractImageKeysFromContent(raw);
+export async function renderMessageContent(message, imageBudget = { remaining: 0 }, deps = {}) {
+  const rawContent = message.content ?? '';
+  const raw = messageContentRawText(rawContent);
+  const readableText = messageReadableText(rawContent);
+  const normalized = (readableText || raw).replace(/\s+/g, ' ').trim();
+  let imageKeys = extractImageKeysFromContent(rawContent);
+  if (imageKeys.length === 0) imageKeys = extractImageKeysFromContent(raw);
   if (message.message_id && imageBudget.remaining > 0 && imageKeys.length === 0 && looksLikeImageOnlyPlaceholder(raw)) {
-    const fetched = await fetchMessageById(message.message_id);
+    const fetched = await (deps.fetchMessageById || fetchMessageById)(message.message_id);
     if (fetched && fetched.content && fetched.content !== message.content) {
       return renderMessageContent(
         { ...fetched, message_id: fetched.message_id || fetched.id || message.message_id },
         imageBudget,
+        deps,
       );
     }
     imageKeys = extractImageKeysFromContent(fetched?.content || '');
   }
-  if (!message.message_id || imageBudget.remaining <= 0 || imageKeys.length === 0) {
+  if (!message.message_id || imageKeys.length === 0) {
     return normalized;
   }
 
   const descriptions = [];
   for (const key of imageKeys) {
+    const cached = getCachedImageDescription(message.message_id, key);
+    if (cached) {
+      descriptions.push({ key, text: `【系统已读取并识别图片：${cached}】` });
+      continue;
+    }
     if (imageBudget.remaining <= 0) {
       descriptions.push({ key, text: `[Image: ${key}]` });
       continue;
     }
     imageBudget.remaining -= 1;
-    const description = await describeMessageImage(message.message_id, key);
+    const description = await (deps.describeMessageImage || describeMessageImage)(message.message_id, key);
+    rememberImageDescription(message.message_id, key, description);
     descriptions.push({ key, text: description ? `【系统已读取并识别图片：${description}】` : `[Image: ${key}]` });
   }
 
@@ -607,7 +685,7 @@ export async function renderMessageContent(message, imageBudget = { remaining: 0
       .replace(/\s+/g, ' ')
       .trim();
   }
-  return descriptions.map((d) => d.text).join(' ');
+  return [readableText, ...descriptions.map((d) => d.text)].filter(Boolean).join(' ');
 }
 
 export async function getRecentChatContext(chatId, { limit = 15, messageId = '', includeImages = true } = {}) {
@@ -1608,11 +1686,11 @@ const TOOLS = [
     description:
       '切换机器人长期使用的人格（仅主人可用，需确认卡片或确认码确认后生效）。' +
       'scope=current_chat 表示只修改当前群聊；scope=global 表示修改全局默认人格。' +
-      '用于"这个群以后用学术人格""全局改成日常人格""切换成 academic_serious""切换到自动人格"。',
+      '用于"这个群以后用学术人格""全局改成日常人格""切换成猫娘人格""切换到自动人格"。',
     parameters: {
       type: 'object',
       properties: {
-        persona_id: { type: 'string', description: '目标人格 id 或别名，如 auto、daily_assistant、academic_serious、自动、日常、学术' },
+        persona_id: { type: 'string', description: '目标人格 id 或别名，如 auto、daily_assistant、academic_serious、cute_catgirl_style、自动、日常、学术、猫娘' },
         scope: { type: 'string', enum: ['current_chat', 'global'], description: '切换范围；群聊默认 current_chat，私聊默认 global' },
       },
       required: ['persona_id'],
@@ -1775,6 +1853,188 @@ const TOOLS = [
         };
       }
       return { error: '发起授权卡片失败', detail: (r.err || r.out || '').slice(-2000) };
+    },
+  },
+
+  // ============ Workflow 管理（仅主人）：创建/查询/取消/重试 durable workflow ============
+  {
+    name: 'start_workflow',
+    description:
+      '把一个复杂多步骤目标创建为本地持久化 workflow 并立即推进到完成、失败或等待确认。' +
+      '当前用于 durable workflow 生命周期：计划落盘、步骤推进、确认暂停和恢复；不会自动执行真实飞书写操作。' +
+      '当用户明确要求“按 workflow/复杂任务/可恢复任务处理”时使用；普通问答不要调用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '工作流标题，简短描述任务' },
+        user_goal: { type: 'string', description: '用户的原始复杂目标' },
+        workflow_type: {
+          type: 'string',
+          enum: ['generic', 'doc_report', 'meeting_schedule', 'data_analysis', 'material_review'],
+          description: '工作流类型，未知时用 generic',
+        },
+        steps: {
+          type: 'array',
+          maxItems: 12,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: '步骤 id，可选；建议英文小写加下划线' },
+              type: { type: 'string', enum: ['plan', 'tool', 'transform', 'verify', 'confirm', 'send'], description: '步骤类型' },
+              title: { type: 'string', description: '步骤标题' },
+              input: { type: 'object', additionalProperties: true, description: '步骤输入，可选' },
+            },
+            required: ['type', 'title'],
+          },
+          description: '结构化步骤。需要人工确认时包含一个 type=confirm 的步骤。',
+        },
+        require_confirmation: { type: 'boolean', description: '为 true 时若 steps 中没有 confirm，会自动追加确认步骤' },
+        confirmation_message: { type: 'string', description: '确认步骤展示给用户的确认内容' },
+      },
+      required: ['user_goal'],
+    },
+    ownerOnly: true,
+    async run({
+      title,
+      user_goal,
+      workflow_type = 'generic',
+      steps = [],
+      require_confirmation = false,
+      confirmation_message = '',
+    }, ctx) {
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.saveWorkflow || !stateStore?.getWorkflow) {
+        return { error: '运行态状态存储不可用，无法创建 workflow' };
+      }
+      const workflow = createWorkflowFromRequest({
+        title,
+        userGoal: user_goal,
+        workflowType: workflow_type,
+        sessionKey: ctx.sessionKey || (ctx.chatId ? `g:${ctx.chatId}:${ctx.senderId || 'unknown'}` : `p:${ctx.senderId || 'unknown'}`),
+        ownerId: ctx.senderId || '',
+        steps,
+        requireConfirmation: Boolean(require_confirmation),
+        confirmationMessage: confirmation_message,
+      });
+      stateStore.saveWorkflow(workflow);
+      const runner = createRuntimeWorkflowRunner({
+        stateStore,
+        progressSink: ctx.workflowProgressSink,
+      });
+      const result = await runner.run(workflow.workflowId);
+      if (result.status === 'waiting_confirmation') {
+        if (typeof ctx.registerPendingWrite !== 'function') {
+          return { error: 'workflow 已进入等待确认，但当前入口不支持登记确认动作', workflowId: result.workflow.workflowId };
+        }
+        const action = buildWorkflowApprovalAction(result.workflow, {
+          confirmationKey: ctx.confirmationKey || '',
+        });
+        ctx.registerPendingWrite(action);
+        return {
+          needConfirm: true,
+          actionId: action.id,
+          confirmToken: action.confirmToken,
+          workflowId: result.workflow.workflowId,
+          message: action.preview,
+        };
+      }
+      return {
+        ok: result.status === 'completed',
+        workflow: workflowSummary(result.workflow),
+        message: formatWorkflowRunResult(result),
+      };
+    },
+  },
+
+  {
+    name: 'workflow_status',
+    description:
+      '查询本地 durable workflow 状态。可按 workflow_id 查单个，也可按 status 列出最近任务。' +
+      '用于“查一下刚才的复杂任务/工作流进度/失败原因”。',
+    parameters: {
+      type: 'object',
+      properties: {
+        workflow_id: { type: 'string', description: 'workflowId；不传时列出最近 workflow' },
+        status: { type: 'string', enum: ['pending', 'running', 'waiting_confirmation', 'completed', 'failed', 'canceled'], description: '按状态过滤，可选' },
+        limit: { type: 'number', minimum: 1, maximum: 20, description: '最多返回多少个，默认 5' },
+      },
+      required: [],
+    },
+    ownerOnly: true,
+    run({ workflow_id, status, limit = 5 }, ctx) {
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.getWorkflow || !stateStore?.listWorkflows) {
+        return { error: '运行态状态存储不可用，无法查询 workflow' };
+      }
+      const id = String(workflow_id || '').trim();
+      if (id) {
+        const workflow = stateStore.getWorkflow(id);
+        if (!workflow) return { error: `未找到 workflow：${id}` };
+        return { workflow: workflowSummary(workflow), detail: formatWorkflowForUser(workflow) };
+      }
+      const rows = stateStore
+        .listWorkflows({ status: status || undefined, sessionKey: ctx.sessionKey || undefined })
+        .slice(0, Math.max(1, Math.min(20, Number(limit) || 5)))
+        .map(workflowSummary);
+      return { workflows: rows, count: rows.length };
+    },
+  },
+
+  {
+    name: 'workflow_cancel',
+    description:
+      '取消一个本地 durable workflow。用于用户明确说“取消某个 workflow/复杂任务”。',
+    parameters: {
+      type: 'object',
+      properties: {
+        workflow_id: { type: 'string', description: '要取消的 workflowId' },
+        reason: { type: 'string', description: '取消原因，可选' },
+      },
+      required: ['workflow_id'],
+    },
+    ownerOnly: true,
+    async run({ workflow_id, reason = '用户取消' }, ctx) {
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.getWorkflow || !stateStore?.saveWorkflow) {
+        return { error: '运行态状态存储不可用，无法取消 workflow' };
+      }
+      const workflow = stateStore.getWorkflow(workflow_id);
+      if (!workflow) return { error: `未找到 workflow：${workflow_id}` };
+      const runner = createRuntimeWorkflowRunner({ stateStore });
+      const result = await runner.cancel(workflow_id, reason);
+      return { workflow: workflowSummary(result.workflow), message: formatWorkflowRunResult(result) };
+    },
+  },
+
+  {
+    name: 'workflow_retry',
+    description:
+      '重试一个失败 workflow 的指定步骤；如果不传 step_id，则重试当前失败步骤或第一个失败步骤。',
+    parameters: {
+      type: 'object',
+      properties: {
+        workflow_id: { type: 'string', description: '要重试的 workflowId' },
+        step_id: { type: 'string', description: '要重试的步骤 id，可选' },
+        reason: { type: 'string', description: '重试原因，可选' },
+      },
+      required: ['workflow_id'],
+    },
+    ownerOnly: true,
+    async run({ workflow_id, step_id, reason = '用户重试' }, ctx) {
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.getWorkflow || !stateStore?.saveWorkflow) {
+        return { error: '运行态状态存储不可用，无法重试 workflow' };
+      }
+      const workflow = stateStore.getWorkflow(workflow_id);
+      if (!workflow) return { error: `未找到 workflow：${workflow_id}` };
+      const stepRef = step_id || workflow.steps?.find((step) => step.status === 'failed')?.id || workflow.steps?.[workflow.currentStep]?.id;
+      if (!stepRef) return { error: '没有可重试的 workflow 步骤' };
+      const runner = createRuntimeWorkflowRunner({
+        stateStore,
+        progressSink: ctx.workflowProgressSink,
+      });
+      const result = await runner.retry(workflow_id, stepRef, { reason });
+      return { workflow: workflowSummary(result.workflow), message: formatWorkflowRunResult(result) };
     },
   },
 
@@ -1989,6 +2249,7 @@ export const __testing = Object.freeze({
   readResponseLimited,
   supportsIdentityFlag,
   extractImageKeysFromContent,
+  messageReadableText,
   applyMentionsToContent,
   inferMentionTargets,
   resolveVisibleMentionsInContent,

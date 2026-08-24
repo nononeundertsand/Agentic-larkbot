@@ -44,7 +44,7 @@ import { getOwnerName, getOwnerOpenId, initOwnerIdentity, isOwnerSender, maskId 
 import { containsLarkAtTag, larkAtTag, postContentFromTextWithMentions } from './lark-format.mjs';
 import { splitReplyText } from './reply-parts.mjs';
 import { formatSafetyRefusal } from './safety-response.mjs';
-import { AUTO_PERSONA_ID, getPersona, normalizePersonaSetting, resolvePersonaForMessage } from './persona.mjs';
+import { AUTO_PERSONA_ID, getPersona, normalizePersonaSetting, polishPersonaReply, resolvePersonaForMessage } from './persona.mjs';
 import {
   executeApprovedSandboxShellAction,
   executeApprovedShellAction,
@@ -55,6 +55,11 @@ import {
   shellDockerEnabled,
   shellEnabled,
 } from './shell.mjs';
+import {
+  cancelWorkflowApproval,
+  executeWorkflowApproval,
+  formatWorkflowProgressMessage,
+} from './workflow-control.mjs';
 
 const LARK_CLI = process.env.LARK_CLI_BIN || 'lark-cli';
 const EVENT_KEY = 'im.message.receive_v1';
@@ -106,12 +111,19 @@ function contentPreview(text) {
 }
 
 const GROUP_CONTEXT_HINT_RE = /(这|那|刚才|上面|前面|前文|他们|她们|他说|她说|大家|怎么看|对吗|啥意思|什么情况|总结|梳理|继续|接着|评评理|争|讨论|聊)/i;
+const GROUP_IMAGE_CONTEXT_HINT_RE = /(图|图片|截图|照片|表情包|动图|这张|那张|图里|画面|识别|解析|image|photo|picture|pic|meme)/i;
 function shouldPrefetchGroupContext(text) {
   if (GROUP_CONTEXT_PREFETCH === 'off') return false;
   if (GROUP_CONTEXT_PREFETCH === 'on') return true;
   const clean = String(text || '').trim();
   if (!clean) return true;
   return clean.length <= 40 || GROUP_CONTEXT_HINT_RE.test(clean);
+}
+
+function shouldIncludeGroupContextImages(text) {
+  if (!GROUP_CONTEXT_INCLUDE_IMAGES) return false;
+  const clean = String(text || '');
+  return GROUP_IMAGE_CONTEXT_HINT_RE.test(clean) || /\[Image:?|【系统已读取并识别图片/.test(clean);
 }
 
 async function renderCurrentMessageText(messageId, text, { includeImages = true } = {}) {
@@ -402,9 +414,25 @@ async function executePendingApproval(pending) {
   if (pending.executor === 'persona') {
     return executePersonaApproval(pending.persona || {});
   }
+  if (pending.executor === 'workflow') {
+    return executeWorkflowApproval(pending, {
+      stateStore,
+      progressSink: async (event, workflow) => {
+        const text = formatWorkflowProgressMessage(event, workflow);
+        if (text && pending.messageId) await replyMessage(pending.messageId, text);
+      },
+    });
+  }
   const r = await runLark(pending.args);
   if (r.code !== 0 || r.json?.ok === false) return formatLarkFailureForUser(r);
   return formatLarkSuccessForUser(pending, r);
+}
+
+async function cancelPendingApproval(pending) {
+  if (pending?.executor === 'workflow') {
+    return cancelWorkflowApproval(pending, { stateStore });
+  }
+  return '好的，已取消该操作。';
 }
 
 function personaSettingName(personaId = '') {
@@ -566,7 +594,7 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
     return { text: await executePendingApproval(decision.action) };
   }
   if (decision.kind === 'cancel') {
-    return { text: '好的，已取消该操作。' };
+    return { text: await cancelPendingApproval(decision.action) };
   }
   if (decision.kind === 'expired') {
     return { text: '这条待确认操作已经过期，未执行。请重新发起操作。' };
@@ -576,6 +604,9 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
     return { text: token
       ? `确认码不匹配，未执行。请回复「确认 ${token}」执行，或「取消」放弃。`
       : '确认内容不匹配，未执行。' };
+  }
+  if (decision.kind === 'superseded' && decision.action?.executor === 'workflow') {
+    await cancelPendingApproval(decision.action);
   }
 
   // 正常 Agent 处理；注入 registerPendingWrite 让写操作可登记待确认
@@ -602,14 +633,26 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
     personaId: personaDecision.personaId,
     answerMode: personaDecision.answerMode,
     confirmedWrite: false,
+    confirmationKey,
+    workflowProgressSink: ctx.messageId
+      ? async (event, workflow) => {
+        const progress = formatWorkflowProgressMessage(event, workflow);
+        if (progress) await replyMessage(ctx.messageId, progress);
+      }
+      : null,
     registerPendingWrite: (action) => {
-      registeredAction = approvals.register(action?.confirmationKey || confirmationKey, action);
+      registeredAction = approvals.register(action?.confirmationKey || confirmationKey, {
+        ...action,
+        messageId: action?.messageId || ctx.messageId || '',
+      });
     },
   };
-  const answer = await runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
+  const rawAnswer = await runAgent(text, agentCtx, { getToolSchemas, getToolMetadata, executeTool });
+  const approvalAction = registeredAction && rawAnswer === registeredAction.preview ? registeredAction : null;
+  const answer = approvalAction ? rawAnswer : polishPersonaReply(rawAnswer, personaDecision.personaId);
   return {
     text: answer,
-    approvalAction: registeredAction && answer === registeredAction.preview ? registeredAction : null,
+    approvalAction,
     personaDecision,
   };
 }
@@ -636,6 +679,7 @@ async function runGroupAgentForMessage({ text, chatId, messageId, senderId, send
     senderDept: senderProfile?.department || '',
     chatId,
     messageId,
+    sessionKey: gKey.id,
     ownerConfirmationKey: OWNER_OPEN_ID ? `g:${chatId}:${OWNER_OPEN_ID}` : '',
     personaDecision,
     ...gCtx,
@@ -757,7 +801,7 @@ async function handleEvent(evt) {
       const recent = await getRecentChatContext(d.chat_id, {
         limit: GROUP_CONTEXT_LIMIT,
         messageId,
-        includeImages: GROUP_CONTEXT_INCLUDE_IMAGES,
+        includeImages: shouldIncludeGroupContextImages(qText),
       });
       if (recent.error) console.warn(`[context] 群聊上下文预取失败 ${messageId}: ${recent.error}`);
       else threadContext = recent.text || '';
@@ -775,8 +819,11 @@ async function handleEvent(evt) {
     const finalResponse = (isBotSender && mentioned)
       ? prefixResponseMention(response, eventSenderBotMention(d))
       : response;
-    const answer = finalResponse.text;
-    const sent = await replyAgentResponse(messageId, finalResponse, { chatId: d.chat_id });
+    const answer = finalResponse.approvalAction
+      ? finalResponse.text
+      : polishPersonaReply(finalResponse.text, personaDecision?.personaId);
+    const polishedResponse = { ...finalResponse, text: answer };
+    const sent = await replyAgentResponse(messageId, polishedResponse, { chatId: d.chat_id });
     if (!sent) {
       forgetHandled(messageId);
       return;
@@ -822,12 +869,16 @@ async function handleEvent(evt) {
       senderName,
       senderDept: senderProfile?.department || '',
       chatId: '',
+      sessionKey: pKey.id,
       ownerConfirmationKey: OWNER_OPEN_ID ? `p:${OWNER_OPEN_ID}` : '',
       personaDecision,
       ...pCtx,
   }, pKey.id, isOwner);
-  const answer = response.text;
-  const sent = await replyAgentResponse(messageId, response);
+  const answer = response.approvalAction
+    ? response.text
+    : polishPersonaReply(response.text, response.personaDecision?.personaId || personaDecision.personaId);
+  const polishedResponse = { ...response, text: answer };
+  const sent = await replyAgentResponse(messageId, polishedResponse);
   if (!sent) {
     forgetHandled(messageId);
     return;
@@ -864,7 +915,7 @@ async function handleCardActionEvent(evt) {
     status = /^执行失败/.test(detail) ? 'failed' : 'success';
   } else if (decision.kind === 'cancel') {
     status = 'canceled';
-    detail = '好的，已取消该操作。';
+    detail = await cancelPendingApproval(action);
   } else if (decision.kind === 'expired') {
     status = 'expired';
     detail = '这条待确认操作已经过期，未执行。请重新发起操作。';

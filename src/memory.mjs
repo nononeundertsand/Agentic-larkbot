@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { updateSummary, extractKeyMemory, updateGroupSummary, extractGroupKeyMemory, currentDefaultModelId } from './reply.mjs';
-import { normalizePersonaId } from './persona.mjs';
+import { normalizePersonaId, personaMemorySearchText } from './persona.mjs';
 
 const SHORT_TURNS = Number(process.env.MEMORY_SHORT_TURNS || 30); // 短期滑动窗口轮数
 const TTL_MS = Number(process.env.MEMORY_TTL_MS || 30 * 60 * 1000); // 短期无活动过期
@@ -139,6 +139,21 @@ function memoryIsActive(item) {
 }
 function activePersonaId(value) {
   return normalizePersonaId(value) || '';
+}
+function queryWithPersonaHints(query, personaId) {
+  const hints = personaMemorySearchText(personaId);
+  return hints ? `${String(query || '')}\n${hints}` : String(query || '');
+}
+function textHasTokenOverlap(text, query) {
+  const queryTokens = [...tokenize(query)];
+  if (!queryTokens.length) return false;
+  const textTokens = tokenize(text);
+  return queryTokens.some((token) => textTokens.has(token));
+}
+function filterByPersonaHints(items = [], personaId = '', toText = (item) => String(item || '')) {
+  const hints = personaMemorySearchText(personaId);
+  if (!hints) return [];
+  return (items || []).filter((item) => textHasTokenOverlap(toText(item), hints));
 }
 function scopeWithPersona(scope, personaId) {
   const id = activePersonaId(personaId);
@@ -476,6 +491,22 @@ function selectRelevantMemories(items, query, { limit = MEMORY_RELEVANT_LIMIT, b
     if (out.length >= limit || used + len > budgetChars) break;
     item.lastUsedAt = nowIso();
     item.useCount = (Number(item.useCount) || 0) + 1;
+    out.push(item);
+    used += len;
+  }
+  return out;
+}
+function mergeSelectedMemories(primary = [], extra = [], { limit = MEMORY_RELEVANT_LIMIT, budgetChars = 2400 } = {}) {
+  const out = [];
+  const seen = new Set();
+  let used = 0;
+  for (const item of [...(primary || []), ...(extra || [])]) {
+    if (!item) continue;
+    const key = item.id || `${item.key || ''}:${memoryContent(item)}`;
+    if (seen.has(key)) continue;
+    const len = memoryContent(item).length + 80;
+    if (out.length >= limit || used + len > budgetChars) break;
+    seen.add(key);
     out.push(item);
     used += len;
   }
@@ -896,6 +927,22 @@ function selectRelevantGraphEdges(edges, query, { limit = MEMORY_GRAPH_RELEVANT_
   }
   return selected;
 }
+function mergeSelectedGraphEdges(primary = [], extra = [], { limit = MEMORY_GRAPH_RELEVANT_LIMIT, budgetChars = 2000 } = {}) {
+  const out = [];
+  const seen = new Set();
+  let used = 0;
+  for (const edge of [...(primary || []), ...(extra || [])]) {
+    if (!edge) continue;
+    const key = edge.id || graphEdgeKey(edge);
+    if (seen.has(key)) continue;
+    const len = graphEdgeText(edge).length + 60;
+    if (out.length >= limit || used + len > budgetChars) break;
+    seen.add(key);
+    out.push(edge);
+    used += len;
+  }
+  return out;
+}
 function formatGraphBrief(edges) {
   return (edges || [])
     .map((edge) => {
@@ -1178,24 +1225,45 @@ export function buildContext(key, { persist: usePersist = false, query = '', bud
   const historyBudget = Math.max(2400, Math.floor(budgetChars * 0.55));
   const summaryBudget = Math.max(600, Math.floor(budgetChars * 0.12));
   const q = query || s.messages.at(-1)?.content || '';
+  const personaQuery = activePersona ? queryWithPersonaHints(q, activePersona) : q;
   const selected = usePersist
     ? selectRelevantMemories(s.memories || [], q, { budgetChars: factBudget })
     : [];
   const selectedGraph = usePersist
     ? selectRelevantGraphEdges(s.graph?.edges || [], q, { budgetChars: graphBudget })
     : [];
-  const selectedPersona = (usePersist && activePersona)
-    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], q, {
+  const selectedPersonaScoped = (usePersist && activePersona)
+    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], personaQuery, {
       limit: MEMORY_PERSONA_RELEVANT_LIMIT,
       budgetChars: personaFactBudget,
     })
     : [];
-  const selectedPersonaGraph = (usePersist && activePersona)
-    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], q, {
+  const selectedPersonaLegacy = (usePersist && activePersona)
+    ? selectRelevantMemories(filterByPersonaHints(s.memories || [], activePersona, (item) => `${item.key || ''} ${item.content || ''} ${item.type || ''}`), personaQuery, {
+      limit: Math.max(2, MEMORY_PERSONA_RELEVANT_LIMIT),
+      budgetChars: personaFactBudget,
+    })
+    : [];
+  const selectedPersona = mergeSelectedMemories(selectedPersonaScoped, selectedPersonaLegacy, {
+    limit: MEMORY_PERSONA_RELEVANT_LIMIT,
+    budgetChars: personaFactBudget,
+  });
+  const selectedPersonaGraphScoped = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], personaQuery, {
       limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
       budgetChars: personaGraphBudget,
     })
     : [];
+  const selectedPersonaGraphLegacy = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(filterByPersonaHints(s.graph?.edges || [], activePersona, graphEdgeText), personaQuery, {
+      limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+      budgetChars: personaGraphBudget,
+    })
+    : [];
+  const selectedPersonaGraph = mergeSelectedGraphEdges(selectedPersonaGraphScoped, selectedPersonaGraphLegacy, {
+    limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+    budgetChars: personaGraphBudget,
+  });
   const graphBrief = formatGraphBrief(selectedGraph);
   const personaGraphBrief = formatGraphBrief(selectedPersonaGraph);
   return {
@@ -1228,6 +1296,7 @@ export function buildGroupContext(chatId, { persist: usePersist = false, query =
   const recentBudget = Math.max(1200, Math.floor(budgetChars * 0.45));
   const summaryBudget = Math.max(500, Math.floor(budgetChars * 0.15));
   const q = query || s.messages.at(-1)?.content || '';
+  const personaQuery = activePersona ? queryWithPersonaHints(q, activePersona) : q;
   const selected = usePersist
     ? selectRelevantMemories(s.memories || [], q, {
       limit: Math.max(4, Math.floor(MEMORY_RELEVANT_LIMIT / 2)),
@@ -1240,18 +1309,38 @@ export function buildGroupContext(chatId, { persist: usePersist = false, query =
       budgetChars: graphBudget,
     })
     : [];
-  const selectedPersona = (usePersist && activePersona)
-    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], q, {
+  const selectedPersonaScoped = (usePersist && activePersona)
+    ? selectRelevantMemories(s.personaMemories?.[activePersona] || [], personaQuery, {
       limit: MEMORY_PERSONA_RELEVANT_LIMIT,
       budgetChars: personaFactBudget,
     })
     : [];
-  const selectedPersonaGraph = (usePersist && activePersona)
-    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], q, {
+  const selectedPersonaLegacy = (usePersist && activePersona)
+    ? selectRelevantMemories(filterByPersonaHints(s.memories || [], activePersona, (item) => `${item.key || ''} ${item.content || ''} ${item.type || ''}`), personaQuery, {
+      limit: Math.max(2, MEMORY_PERSONA_RELEVANT_LIMIT),
+      budgetChars: personaFactBudget,
+    })
+    : [];
+  const selectedPersona = mergeSelectedMemories(selectedPersonaScoped, selectedPersonaLegacy, {
+    limit: MEMORY_PERSONA_RELEVANT_LIMIT,
+    budgetChars: personaFactBudget,
+  });
+  const selectedPersonaGraphScoped = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(s.personaGraph?.[activePersona]?.edges || [], personaQuery, {
       limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
       budgetChars: personaGraphBudget,
     })
     : [];
+  const selectedPersonaGraphLegacy = (usePersist && activePersona)
+    ? selectRelevantGraphEdges(filterByPersonaHints(s.graph?.edges || [], activePersona, graphEdgeText), personaQuery, {
+      limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+      budgetChars: personaGraphBudget,
+    })
+    : [];
+  const selectedPersonaGraph = mergeSelectedGraphEdges(selectedPersonaGraphScoped, selectedPersonaGraphLegacy, {
+    limit: Math.max(2, Math.floor(MEMORY_GRAPH_RELEVANT_LIMIT / 2)),
+    budgetChars: personaGraphBudget,
+  });
   const graphBrief = formatGraphBrief(selectedGraph);
   const personaGraphBrief = formatGraphBrief(selectedPersonaGraph);
   return {

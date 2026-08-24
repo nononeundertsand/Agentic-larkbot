@@ -131,6 +131,13 @@ function routeModelId(task) {
   return currentDefaultModelId();
 }
 
+function firstVisionModelId() {
+  for (const [id, profile] of PROFILES.entries()) {
+    if (profile.vision !== false) return id;
+  }
+  return '';
+}
+
 // 当前默认模型：运行时覆盖优先，其次 .env
 export function currentDefaultModelId() {
   if (runtimeDefaultModel && PROFILES.has(runtimeDefaultModel)) return runtimeDefaultModel;
@@ -162,7 +169,24 @@ export function getProfile(id) {
 export function resolveModelChain({ task, model } = {}) {
   const chain = [];
   if (model && PROFILES.has(model)) chain.push(model); // 显式指定优先
-  else if (task) chain.push(routeModelId(task));
+  else if (task) {
+    const routed = routeModelId(task);
+    if (String(task).toLowerCase() === 'vision') {
+      const profile = getProfile(routed);
+      if (profile?.vision !== false) chain.push(routed);
+      else {
+        const visionModel = firstVisionModelId();
+        if (visionModel) {
+          console.warn(`[models] vision 任务路由到非多模态模型 ${routed}，改用 ${visionModel}`);
+          chain.push(visionModel);
+        } else {
+          chain.push(routed);
+        }
+      }
+    } else {
+      chain.push(routed);
+    }
+  }
   else chain.push(currentDefaultModelId());
   const fallback = process.env.LLM_FALLBACK_MODEL;
   if (fallback && PROFILES.has(fallback)) chain.push(fallback);
