@@ -23,6 +23,78 @@ const schemas = () => [{
   function: { name: 'fake', description: 'fake', parameters: { type: 'object', properties: {} } },
 }];
 
+const workflowSchemas = () => [{
+  type: 'function',
+  function: { name: 'start_workflow', description: 'start workflow', parameters: { type: 'object', properties: {} } },
+}];
+
+test('当前用户直接请求不会被包成 UNTRUSTED_INPUT', async () => {
+  const seenMessages = [];
+  const result = await runAgent('请读取这两个文档链接并总结：https://example.com/a https://example.com/b', baseCtx, {
+    getToolSchemas: schemas,
+    getToolMetadata: (name) => getToolPolicy(name),
+    executeTool: async () => ({ ok: true }),
+    chatLLMRaw: async (messages) => {
+      seenMessages.push(structuredClone(messages));
+      return { role: 'assistant', content: '可以处理' };
+    },
+  });
+
+  assert.equal(result, '可以处理');
+  const lastUser = seenMessages[0].at(-1);
+  assert.equal(lastUser.role, 'user');
+  assert.match(lastUser.content, /CURRENT_USER_REQUEST/);
+  assert.doesNotMatch(lastUser.content, /UNTRUSTED_INPUT/);
+});
+
+test('文档总结请求会确定性路由到 doc_report workflow', async () => {
+  const executed = [];
+  const result = await runAgent(
+    '帮我总结这个飞书文档并生成带引用报告：https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh',
+    { ...baseCtx, stateStore: { saveWorkflow() {}, getWorkflow() {} } },
+    {
+      getToolSchemas: workflowSchemas,
+      getToolMetadata: (name) => getToolPolicy(name),
+      executeTool: async (name, args) => {
+        executed.push({ name, args });
+        return {
+          needConfirm: true,
+          message: '工作流「文档总结报告」需要确认后继续。',
+        };
+      },
+      chatLLMRaw: async () => {
+        throw new Error('doc_report 自动路由不应调用 LLM');
+      },
+    },
+  );
+
+  assert.equal(result, '工作流「文档总结报告」需要确认后继续。');
+  assert.equal(executed.length, 1);
+  assert.equal(executed[0].name, 'start_workflow');
+  assert.equal(executed[0].args.workflow_type, 'doc_report');
+  assert.equal(executed[0].args.target_chars, 1800);
+});
+
+test('普通网页总结不会被强制路由到 doc_report workflow', async () => {
+  const executed = [];
+  const result = await runAgent(
+    '帮我总结这个网页：https://example.com/a',
+    { ...baseCtx, stateStore: { saveWorkflow() {}, getWorkflow() {} } },
+    {
+      getToolSchemas: workflowSchemas,
+      getToolMetadata: (name) => getToolPolicy(name),
+      executeTool: async (name, args) => {
+        executed.push({ name, args });
+        return {};
+      },
+      chatLLMRaw: async () => ({ role: 'assistant', content: '普通网页总结' }),
+    },
+  );
+
+  assert.equal(result, '普通网页总结');
+  assert.equal(executed.length, 0);
+});
+
 test('同轮多个写调用只执行第一个待确认动作', async () => {
   let executed = 0;
   const fakeLLM = async () => ({
@@ -116,9 +188,60 @@ test('外部不可信数据不能继续驱动私密读取', async () => {
 
   assert.deepEqual(executed, ['web_fetch']);
   assert.match(result, /安全判断：敏感信息流拦截/);
-  assert.match(result, /越权路线/);
+  assert.match(result, /如需正常协助/);
   const flattened = JSON.stringify(seenMessages);
   assert.match(flattened, /UNTRUSTED_TOOL_DATA/);
+});
+
+test('当前用户直接给出的网页和飞书文档允许同轮串联读取', async () => {
+  let round = 0;
+  const executed = [];
+  const userText =
+    '帮我总结这几个飞书文档，生成带引用报告：' +
+    'https://bytetech.info/articles/7654024985686016040?from=message_bot#doxcnJ2BghGgHIIKKQlax7sxkbf ' +
+    'https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh';
+  const fakeLLM = async () => {
+    round++;
+    if (round === 1) {
+      return {
+        role: 'assistant',
+        tool_calls: [{
+          id: 'w',
+          function: {
+            name: 'web_fetch',
+            arguments: '{"url":"https://bytetech.info/articles/7654024985686016040?from=message_bot#doxcnJ2BghGgHIIKKQlax7sxkbf"}',
+          },
+        }],
+      };
+    }
+    if (round === 2) {
+      return {
+        role: 'assistant',
+        tool_calls: [{
+          id: 'l',
+          function: {
+            name: 'run_lark_cli',
+            arguments: '{"args":["wiki","+fetch","--token","LpxGwSMfDiZwAkkztg2crzoPnQh"]}',
+          },
+        }],
+      };
+    }
+    return { role: 'assistant', content: '已生成带引用报告草稿' };
+  };
+  const result = await runAgent(userText, baseCtx, {
+    getToolSchemas: schemas,
+    getToolMetadata: (name) => getToolPolicy(name),
+    executeTool: async (name) => {
+      executed.push(name);
+      return name === 'web_fetch'
+        ? { content: '网页正文' }
+        : { content: '飞书文档正文' };
+    },
+    chatLLMRaw: fakeLLM,
+  });
+
+  assert.deepEqual(executed, ['web_fetch', 'run_lark_cli']);
+  assert.equal(result, '已生成带引用报告草稿');
 });
 
 test('外部不可信数据不能继续驱动 Shell 命令', async () => {
@@ -172,7 +295,7 @@ test('读取私密数据后不能静默访问外部网络', async () => {
   });
   assert.deepEqual(executed, ['mail_triage']);
   assert.match(result, /安全判断：敏感信息流拦截/);
-  assert.match(result, /越权路线/);
+  assert.match(result, /如需正常协助/);
 });
 
 test('长期记忆以不可信数据边界注入', async () => {

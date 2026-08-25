@@ -102,6 +102,117 @@ const USER_IDENTITY_ROOTS = new Set([
   'wiki',
 ]);
 const BOT_IDENTITY_ROOTS = new Set(['event', 'im']);
+const URL_CANDIDATE_RE = /https?:\/\/[^\s<>"'`]+/gi;
+const KNOWN_LARK_TOKEN_RE = /\b(?:doxcn|doccn|docxcn|shtcn|bascn|fldcn|objcn|boxcn)[A-Za-z0-9_-]{6,}\b/g;
+const GENERIC_RESOURCE_TOKEN_RE = /\b[A-Za-z0-9_-]{8,}\b/g;
+const TRAILING_URL_PUNCTUATION_RE = /[),.;:!?\]\}>"'`，。；：！？、]+$/;
+const TRAILING_TOKEN_PUNCTUATION_RE = /[),.;:!?\]\}>"'`，。；：！？、]+$/;
+
+function createResourceRefs() {
+  return {
+    urls: new Set(),
+    urlNoHashes: new Set(),
+    tokens: new Set(),
+  };
+}
+
+function isLarkLikeHost(hostname = '') {
+  const host = String(hostname || '').toLowerCase();
+  return host.endsWith('larkoffice.com')
+    || host.endsWith('feishu.cn')
+    || host.endsWith('larksuite.com')
+    || host.endsWith('doubao.com');
+}
+
+function addToken(refs, rawToken) {
+  const token = String(rawToken || '').replace(/^#/, '').replace(TRAILING_TOKEN_PUNCTUATION_RE, '').trim();
+  if (/^[A-Za-z0-9_-]{8,}$/.test(token)) refs.tokens.add(token);
+}
+
+function addUrl(refs, rawUrl) {
+  const candidate = String(rawUrl || '').replace(TRAILING_URL_PUNCTUATION_RE, '').trim();
+  if (!candidate) return;
+  try {
+    const parsed = new URL(candidate);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return;
+    refs.urls.add(parsed.href);
+    const withoutHash = new URL(parsed.href);
+    withoutHash.hash = '';
+    refs.urlNoHashes.add(withoutHash.href);
+    if (parsed.hash) addToken(refs, parsed.hash.slice(1));
+    if (isLarkLikeHost(parsed.hostname)) {
+      for (const segment of parsed.pathname.split('/')) addToken(refs, segment);
+    }
+  } catch {
+    // 忽略非 URL 片段。
+  }
+}
+
+function collectRefsFromText(refs, text, { looseTokens = false } = {}) {
+  const raw = String(text || '');
+  for (const match of raw.matchAll(URL_CANDIDATE_RE)) addUrl(refs, match[0]);
+  for (const match of raw.matchAll(KNOWN_LARK_TOKEN_RE)) addToken(refs, match[0]);
+  if (looseTokens) {
+    for (const match of raw.matchAll(GENERIC_RESOURCE_TOKEN_RE)) addToken(refs, match[0]);
+  }
+  return refs;
+}
+
+function collectRefsFromValue(refs, value, opts = {}) {
+  if (value == null) return refs;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return collectRefsFromText(refs, String(value), opts);
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectRefsFromValue(refs, item, opts);
+    return refs;
+  }
+  if (typeof value === 'object') {
+    for (const item of Object.values(value)) collectRefsFromValue(refs, item, opts);
+  }
+  return refs;
+}
+
+export function extractUserResourceRefs(text = '') {
+  return collectRefsFromText(createResourceRefs(), text, { looseTokens: false });
+}
+
+export function extractToolResourceRefs(name, args = {}) {
+  const refs = createResourceRefs();
+  if (name === 'web_fetch') {
+    collectRefsFromValue(refs, args?.url || '', { looseTokens: false });
+    return refs;
+  }
+  if (name === 'run_lark_cli') {
+    collectRefsFromValue(refs, args?.args || [], { looseTokens: true });
+    return refs;
+  }
+  collectRefsFromValue(refs, args, { looseTokens: false });
+  return refs;
+}
+
+function urlWithoutHash(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return '';
+  }
+}
+
+export function isToolCallGroundedInUserRequest(name, args = {}, userResourceRefs = createResourceRefs()) {
+  const callRefs = extractToolResourceRefs(name, args);
+  for (const url of callRefs.urls) {
+    if (userResourceRefs.urls?.has(url)) return true;
+    const noHash = urlWithoutHash(url);
+    if (noHash && userResourceRefs.urlNoHashes?.has(noHash)) return true;
+  }
+  for (const token of callRefs.tokens) {
+    if (userResourceRefs.tokens?.has(token)) return true;
+  }
+  return false;
+}
 
 export function getToolPolicy(name) {
   return Object.freeze({ ...DEFAULT_POLICY, ...(TOOL_POLICIES[name] || {}) });
@@ -116,7 +227,12 @@ export function authorizeTool(name, _args, ctx = {}) {
 }
 
 // 防止不可信网页/群消息驱动读取主人私有数据，也防止私有数据通过无需确认的网络工具外传。
-export function authorizeToolTransition(policy, state = {}) {
+export function authorizeToolTransition(policy, state = {}, toolCall = {}) {
+  const groundedInCurrentRequest = isToolCallGroundedInUserRequest(
+    toolCall.name,
+    toolCall.args,
+    state.userResourceRefs,
+  );
   if (policy.requiresCleanContext && state.externalTaint) {
     return {
       ok: false,
@@ -130,12 +246,16 @@ export function authorizeToolTransition(policy, state = {}) {
     };
   }
   if (state.externalTaint && policy.dataClass === 'private' && policy.effect === 'read') {
+    if (groundedInCurrentRequest) return { ok: true, allowedBy: 'current_user_resource' };
     return {
       ok: false,
       reason: '为防止外部内容诱导读取私密数据，请把该私密查询作为一条新的独立请求发给我。',
     };
   }
   if (state.privateDataRead && policy.silentEgress) {
+    if (groundedInCurrentRequest && toolCall.name === 'web_fetch') {
+      return { ok: true, allowedBy: 'current_user_resource' };
+    }
     return {
       ok: false,
       reason: '本轮已读取私密数据，出于防泄露考虑不能继续访问外部网络。请另起一条请求。',

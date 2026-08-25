@@ -11,14 +11,34 @@ export const WORKFLOW_TYPES = Object.freeze([
 export const WORKFLOW_STATUSES = Object.freeze(['pending', 'running', 'waiting_confirmation', 'completed', 'failed', 'canceled']);
 export const WORKFLOW_STEP_TYPES = Object.freeze(['plan', 'tool', 'transform', 'verify', 'confirm', 'send']);
 export const WORKFLOW_STEP_STATUSES = Object.freeze(['pending', 'running', 'waiting_confirmation', 'completed', 'failed', 'skipped']);
-export const ARTIFACT_TYPES = Object.freeze(['text', 'json', 'report', 'table', 'chart', 'file', 'draft']);
+export const WORKFLOW_GATE_STATUSES = Object.freeze(['pending', 'passed', 'failed', 'blocked']);
+export const WORKFLOW_NODE_RESULT_STATUSES = Object.freeze(['DONE', 'DONE_WITH_CONCERNS', 'NEEDS_CONTEXT', 'BLOCKED', 'FAILED', 'CANCELED']);
+export const WORKFLOW_DISPATCH_STATES = Object.freeze(['ready', 'awaiting_user_confirmation', 'awaiting_graph_reconcile']);
+export const ARTIFACT_TYPES = Object.freeze(['text', 'json', 'report', 'table', 'chart', 'file', 'draft', 'lark_doc']);
 export const CITATION_TYPES = Object.freeze(['doc', 'wiki', 'message', 'meeting', 'sheet', 'base', 'mail', 'web', 'memory', 'artifact']);
-export const PROGRESS_EVENT_TYPES = Object.freeze(['created', 'started', 'step_started', 'step_completed', 'waiting_confirmation', 'failed', 'retried', 'canceled', 'completed']);
+export const PROGRESS_EVENT_TYPES = Object.freeze([
+  'created',
+  'started',
+  'step_started',
+  'step_completed',
+  'waiting_confirmation',
+  'node_result_recorded',
+  'gate_updated',
+  'graph_reconcile_required',
+  'completion_blocked',
+  'failed',
+  'retried',
+  'canceled',
+  'completed',
+]);
 
 const WORKFLOW_TYPE_SET = new Set(WORKFLOW_TYPES);
 const STATUS_SET = new Set(WORKFLOW_STATUSES);
 const STEP_TYPE_SET = new Set(WORKFLOW_STEP_TYPES);
 const STEP_STATUS_SET = new Set(WORKFLOW_STEP_STATUSES);
+const GATE_STATUS_SET = new Set(WORKFLOW_GATE_STATUSES);
+const NODE_RESULT_STATUS_SET = new Set(WORKFLOW_NODE_RESULT_STATUSES);
+const DISPATCH_STATE_SET = new Set(WORKFLOW_DISPATCH_STATES);
 const ARTIFACT_TYPE_SET = new Set(ARTIFACT_TYPES);
 const CITATION_TYPE_SET = new Set(CITATION_TYPES);
 const PROGRESS_TYPE_SET = new Set(PROGRESS_EVENT_TYPES);
@@ -37,6 +57,10 @@ function plainObject(value) {
 
 function asObject(value) {
   return plainObject(value) ? value : {};
+}
+
+function asStringArray(value) {
+  return Array.isArray(value) ? value.map(String) : [];
 }
 
 function assertKnown(value, set, label) {
@@ -73,13 +97,77 @@ export function normalizeWorkflowStep(step = {}, index = 0) {
     output: step.output ?? null,
     error: step.error ?? null,
     requiresConfirmation: Boolean(step.requiresConfirmation),
-    artifactIds: Array.isArray(step.artifactIds) ? step.artifactIds.map(String) : [],
-    citationIds: Array.isArray(step.citationIds) ? step.citationIds.map(String) : [],
+    depends: asStringArray(step.depends),
+    gateIds: asStringArray(step.gateIds || step.gate_ids),
+    acceptance: String(step.acceptance || ''),
+    artifactIds: asStringArray(step.artifactIds),
+    citationIds: asStringArray(step.citationIds),
+    nodeResultIds: asStringArray(step.nodeResultIds || step.node_result_ids),
     retryCount: Math.max(0, Number(step.retryCount) || 0),
     timeoutMs: Number.isFinite(Number(step.timeoutMs)) ? Math.max(0, Number(step.timeoutMs)) : 0,
     startedAt: step.startedAt || '',
     endedAt: step.endedAt || '',
     updatedAt: step.updatedAt || '',
+  };
+}
+
+export function createWorkflowGate({
+  id = `gate_${randomUUID()}`,
+  title = '',
+  status = 'pending',
+  acceptance = '',
+  requiredEvidence = [],
+  evidenceRefs = [],
+  passedByNodeResultId = '',
+  metadata = {},
+  updatedAt = '',
+} = {}) {
+  assertKnown(status, GATE_STATUS_SET, 'workflow gate status');
+  return {
+    id: String(id),
+    title: String(title || id || ''),
+    status,
+    acceptance: String(acceptance || ''),
+    requiredEvidence: asStringArray(requiredEvidence),
+    evidenceRefs: asStringArray(evidenceRefs),
+    passedByNodeResultId: String(passedByNodeResultId || ''),
+    metadata: asObject(metadata),
+    updatedAt: String(updatedAt || ''),
+  };
+}
+
+export function createNodeResult({
+  id = `result_${randomUUID()}`,
+  stepId = '',
+  status = 'DONE',
+  summary = '',
+  deliverables = [],
+  findings = [],
+  concerns = [],
+  evidence = [],
+  artifactIds = [],
+  citationIds = [],
+  gateUpdates = [],
+  requestedContext = [],
+  metadata = {},
+  completedAt = nowIso(),
+} = {}) {
+  assertKnown(status, NODE_RESULT_STATUS_SET, 'workflow nodeResult status');
+  return {
+    id: String(id),
+    stepId: String(stepId || ''),
+    status,
+    summary: String(summary || ''),
+    deliverables: asStringArray(deliverables),
+    findings: asStringArray(findings),
+    concerns: asStringArray(concerns),
+    evidence: asStringArray(evidence),
+    artifactIds: asStringArray(artifactIds),
+    citationIds: asStringArray(citationIds),
+    gateUpdates: Array.isArray(gateUpdates) ? gateUpdates.map((update) => asObject(update)) : [],
+    requestedContext: asStringArray(requestedContext),
+    metadata: asObject(metadata),
+    completedAt: String(completedAt || nowIso()),
   };
 }
 
@@ -148,6 +236,19 @@ export function createProgressEvent({
   };
 }
 
+export function normalizeWorkflowControl(control = {}) {
+  const input = asObject(control);
+  const dispatchState = String(input.dispatchState || input.dispatch_state || 'ready');
+  assertKnown(dispatchState, DISPATCH_STATE_SET, 'workflow dispatch state');
+  return {
+    dispatchState,
+    reason: String(input.reason || ''),
+    confirmationConsumed: input.confirmationConsumed === undefined
+      ? dispatchState === 'ready'
+      : Boolean(input.confirmationConsumed),
+  };
+}
+
 function normalizeArtifactMap(raw) {
   const entries = plainObject(raw) ? Object.entries(raw) : [];
   return Object.fromEntries(entries.map(([id, artifact]) => {
@@ -160,6 +261,19 @@ function normalizeCitationMap(raw) {
   const entries = plainObject(raw) ? Object.entries(raw) : [];
   return Object.fromEntries(entries.map(([id, citation]) => {
     const normalized = createCitation({ id, ...asObject(citation) });
+    return [normalized.id, normalized];
+  }));
+}
+
+function normalizeGateList(raw) {
+  const items = Array.isArray(raw) ? raw : [];
+  return items.map((gate, index) => createWorkflowGate({ id: `gate_${index + 1}`, ...asObject(gate) }));
+}
+
+function normalizeNodeResultMap(raw) {
+  const entries = plainObject(raw) ? Object.entries(raw) : [];
+  return Object.fromEntries(entries.map(([id, result]) => {
+    const normalized = createNodeResult({ id, ...asObject(result) });
     return [normalized.id, normalized];
   }));
 }
@@ -184,6 +298,9 @@ export function normalizeWorkflow(raw = {}) {
     userGoal: String(input.userGoal || input.metadata?.userGoal || ''),
     plan: normalizeWorkflowPlan(input.plan),
     steps,
+    gates: normalizeGateList(input.gates),
+    nodeResults: normalizeNodeResultMap(input.nodeResults || input.node_results),
+    control: normalizeWorkflowControl(input.control),
     artifacts: normalizeArtifactMap(input.artifacts),
     citations: normalizeCitationMap(input.citations),
     progressEvents: Array.isArray(input.progressEvents)
@@ -217,6 +334,9 @@ export function createWorkflowV2(input = {}) {
     userGoal: input.userGoal || '',
     plan: input.plan || {},
     steps: input.steps || [],
+    gates: input.gates || [],
+    nodeResults: input.nodeResults || {},
+    control: input.control || {},
     artifacts: input.artifacts || {},
     citations: input.citations || {},
     progressEvents: input.progressEvents || [createProgressEvent({ type: 'created', message: 'workflow created' })],
@@ -306,6 +426,7 @@ export function markWorkflowRetry(workflow, stepRef, { reason = '' } = {}) {
   return appendWorkflowProgress({
     ...current,
     status: 'running',
+    control: normalizeWorkflowControl({ dispatchState: 'ready' }),
     steps,
     currentStep: index,
     updatedAt: nowIso(),

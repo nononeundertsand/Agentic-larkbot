@@ -8,8 +8,9 @@ export function runLark(args, opts = {}) {
   return new Promise((resolve) => {
     const timeoutMs = Number(opts.timeoutMs || DEFAULT_TIMEOUT_MS);
     const maxOutputBytes = Number(opts.maxOutputBytes || DEFAULT_MAX_OUTPUT);
+    const hasInput = opts.input !== undefined && opts.input !== null;
     const child = spawn(LARK_CLI, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
     });
     let out = '';
@@ -49,6 +50,10 @@ export function runLark(args, opts = {}) {
     child.stdout.on('data', (d) => { out = collect(out, d.toString()); });
     child.stderr.on('data', (d) => { err = collect(err, d.toString()); });
     child.on('error', (e) => finish({ code: -1, json: null, out: '', err: e.message }));
+    if (hasInput) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(String(opts.input));
+    }
     child.on('close', (code) => {
       closed = true;
       if (killTimer) clearTimeout(killTimer);

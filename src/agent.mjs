@@ -36,6 +36,7 @@ import {
   chatLLMRaw,
   SYSTEM_PROMPT,
   wrapUntrusted,
+  wrapCurrentUserRequest,
   ANTI_INJECTION_NOTE,
   llmConfigured,
   mockReply,
@@ -43,12 +44,13 @@ import {
   runAgentLegacy,
   currentDefaultModelId,
 } from './reply.mjs';
-import { authorizeToolTransition, getToolPolicy } from './policy.mjs';
+import { authorizeToolTransition, extractUserResourceRefs, getToolPolicy } from './policy.mjs';
 import { randomUUID } from 'node:crypto';
 import { formatSafetyRefusal } from './safety-response.mjs';
 import { createAgentTrace, previewForTrace } from './trace.mjs';
 import { buildPersonaSystemNote } from './persona.mjs';
 import { resolveModelChain } from './models.mjs';
+import { extractDocSources } from './doc-source-parser.mjs';
 
 const MAX_ITERS = Number(process.env.AGENT_MAX_ITERS || 6);
 const MAX_TOOL_CALLS = Number(process.env.AGENT_MAX_TOOL_CALLS || 10);
@@ -61,6 +63,31 @@ const MEMORY_DATA_CLOSE = '<<<END_UNTRUSTED_MEMORY_DATA>>>';
 const FALLBACK_ERROR = '抱歉，我在处理时遇到点问题（可能是服务波动或超时），请稍后再问我一次～';
 const FALLBACK_EXHAUSTED = '抱歉，这个请求需要的步骤有点多，我没能在限定步数内查完。可以说得更具体一点，或稍后再问我一次～';
 const EMPTY_REPLY = '（我暂时没有想到合适的回复）';
+const DOC_REPORT_INTENT_RE = /(总结|概括|梳理|提炼|报告|纪要|要点|风险|引用|summarize|summary|report|review)/i;
+
+function toolAvailable(tools = [], name = '') {
+  return Array.isArray(tools) && tools.some((tool) => (tool.function?.name || tool.name) === name);
+}
+
+function docReportTargetChars(text = '') {
+  if (/(详细|完整|深入|全面|长文|长报告|深度|详尽)/i.test(text)) return 3000;
+  if (/(简短|简版|一句话|简单|大概|快速)/i.test(text)) return 900;
+  return 1800;
+}
+
+function shouldAutoStartDocReportWorkflow(text = '', ctx = {}, tools = []) {
+  if (!ctx.isOwner || !ctx.stateStore || !toolAvailable(tools, 'start_workflow')) return false;
+  if (!DOC_REPORT_INTENT_RE.test(text)) return false;
+  return extractDocSources(text).some((source) => {
+    if (source.kind === 'doc' || source.kind === 'wiki') return true;
+    try {
+      const host = new URL(source.url).hostname.toLowerCase();
+      return host === 'bytetech.info' || host.endsWith('.bytetech.info');
+    } catch {
+      return false;
+    }
+  });
+}
 
 // 当前时间行：让 LLM 能正确推断「今天/明天/下周一」，calendar/task 拼 ISO 时间的前提。带 +08:00 时区。
 function nowLine() {
@@ -137,6 +164,7 @@ function buildMessages(ctx, text, hasTools) {
       '如果工具列表中包含 run_shell_command，且主人明确要求运行命令或 Python 代码，应优先调用该工具实际执行，不要声称没有代码执行工具，也不要凭空推演输出。' +
       '访客只允许通过 run_shell_command 发起下载类命令：apt/apt-get download <包名>、受限 curl/wget 公开 http/https URL；访客下载会等待主人确认，非下载命令不得尝试。' +
       '下载 Debian 包时使用 apt download，不要使用 apt install。运行 Python 代码时使用 run_shell_command 的 command="python3"、args=["-c", 代码字符串]；工具会负责 Docker/沙箱/确认策略。' +
+      '如果用户要求总结飞书文档/wiki/ByteTech 链接、生成带引用报告、或生成后发到群里，应优先调用 start_workflow，workflow_type 设为 doc_report；不要只用 run_lark_cli 读一小段后给短摘要。' +
       '需要实时数据或执行操作时优先调用工具，不要编造。' +
       '能一步查到就别绕路；工具返回 refused/error/needConfirm 时，如实、礼貌地转达给用户。'
     : '';
@@ -162,7 +190,7 @@ function buildMessages(ctx, text, hasTools) {
     ...(history || []).map((m) => (m.role === 'user'
       ? { role: 'user', content: wrapUntrusted(m.content) }
       : { role: 'assistant', content: String(m.content || '') })),
-    { role: 'user', content: wrapUntrusted(text) },
+    { role: 'user', content: wrapCurrentUserRequest(text) },
   ];
 }
 
@@ -235,7 +263,7 @@ async function actNode(state, assistantMsg, executeTool, getToolMetadata) {
         requiresCleanContext: Boolean(policy.requiresCleanContext),
       },
     });
-    const transition = authorizeToolTransition(policy, state);
+    const transition = authorizeToolTransition(policy, state, { name, args });
     if (!transition.ok) {
       state.trace.step('guard', {
         status: 'blocked',
@@ -354,6 +382,7 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
     callSignatures: new Map(),
     externalTaint: false,
     privateDataRead: false,
+    userResourceRefs: extractUserResourceRefs(text),
   };
   state.trace = createAgentTrace({
     mode: deps.traceMode,
@@ -380,6 +409,30 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
       memoryBriefPreview: previewForTrace(ctx.memoryBrief || ''),
       groupMemoryBriefPreview: previewForTrace(ctx.groupMemoryBrief || ''),
     });
+    if (shouldAutoStartDocReportWorkflow(text, ctx, tools)) {
+      state.trace.step('route', {
+        target: 'start_workflow',
+        workflowType: 'doc_report',
+        reason: 'doc_report_intent_with_sources',
+      });
+      const result = await executeTool('start_workflow', {
+        title: '文档总结报告',
+        user_goal: text,
+        workflow_type: 'doc_report',
+        target_chars: docReportTargetChars(text),
+      }, ctx);
+      const response = result?.message
+        || (result?.error ? `执行失败：${result.error}` : '已创建文档总结工作流。');
+      state.trace.step('respond', {
+        status: result?.needConfirm ? 'need_confirm' : result?.ok ? 'ok' : result?.error ? 'error' : 'ok',
+        content: response,
+      });
+      state.trace.finish(result?.error ? 'failed' : result?.needConfirm ? 'need_confirm' : 'ok', {
+        response,
+        toolCallCount: 1,
+      });
+      return response;
+    }
     // reason ↔ act ↔ guard ↔ observe 循环
     while (true) {
       const reasonStarted = Date.now();

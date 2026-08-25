@@ -7,6 +7,13 @@ import {
   markWorkflowRetry,
   normalizeWorkflow,
 } from './workflow-schema.mjs';
+import {
+  isSuccessfulNodeResultStatus,
+  reconcileNodeResult,
+  recordNodeResult,
+  setWorkflowControl,
+} from './workflow-graph.mjs';
+import { evaluateWorkflowCompletion } from './workflow-completion.mjs';
 
 function nowIso() {
   return new Date().toISOString();
@@ -19,6 +26,14 @@ function resumeToken() {
 function asArray(value) {
   if (value == null) return [];
   return Array.isArray(value) ? value : [value];
+}
+
+function asObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function unique(values) {
+  return [...new Set(asArray(values).filter((value) => String(value || '').trim()).map(String))];
 }
 
 function stepIndex(workflow, stepRef = workflow.currentStep) {
@@ -60,6 +75,32 @@ function mergeStepArtifacts(workflow, stepId, result = {}) {
   artifactIds.push(...asArray(result.artifactIds).map(String));
   citationIds.push(...asArray(result.citationIds).map(String));
   return { workflow: next, artifactIds: [...new Set(artifactIds)], citationIds: [...new Set(citationIds)] };
+}
+
+function nodeResultFromStepResult(step, result = {}, merged = {}) {
+  const explicit = asObject(result.nodeResult || result.node_result);
+  return {
+    ...explicit,
+    stepId: explicit.stepId || explicit.step_id || step.id,
+    status: explicit.status || result.nodeStatus || result.node_status || 'DONE',
+    summary: explicit.summary || result.summary || result.progressMessage || step.title,
+    deliverables: explicit.deliverables ?? result.deliverables ?? [],
+    findings: explicit.findings ?? result.findings ?? [],
+    concerns: explicit.concerns ?? result.concerns ?? [],
+    evidence: explicit.evidence ?? result.evidence ?? [],
+    artifactIds: unique([
+      ...asArray(merged.artifactIds),
+      ...asArray(explicit.artifactIds || explicit.artifact_ids),
+      ...asArray(result.artifactIds || result.artifact_ids),
+    ]),
+    citationIds: unique([
+      ...asArray(merged.citationIds),
+      ...asArray(explicit.citationIds || explicit.citation_ids),
+      ...asArray(result.citationIds || result.citation_ids),
+    ]),
+    gateUpdates: explicit.gateUpdates || explicit.gate_updates || result.gateUpdates || result.gate_updates || [],
+    requestedContext: explicit.requestedContext || explicit.requested_context || result.requestedContext || result.requested_context || [],
+  };
 }
 
 function defaultStepHandler(type) {
@@ -112,8 +153,31 @@ export class WorkflowRunner {
     return next;
   }
 
+  async fanoutGraphProgress(before, after) {
+    if (typeof this.progressSink !== 'function') return;
+    const previousCount = Array.isArray(before?.progressEvents) ? before.progressEvents.length : 0;
+    const events = Array.isArray(after?.progressEvents) ? after.progressEvents.slice(previousCount) : [];
+    for (const event of events) {
+      try {
+        await this.progressSink(event, after);
+      } catch (err) {
+        this.logger.warn?.('[workflow-runner] progressSink 失败：', err.message);
+      }
+    }
+  }
+
   handlerFor(step) {
     return this.handlers[step.id] || this.handlers[step.type] || defaultStepHandler(step.type);
+  }
+
+  controlBlockedResult(workflow) {
+    if (workflow.control?.dispatchState === 'awaiting_graph_reconcile') {
+      return { status: 'awaiting_graph_reconcile', workflow, reason: workflow.control.reason || 'workflow 需要重新规划后继续' };
+    }
+    if (workflow.control?.dispatchState === 'awaiting_user_confirmation') {
+      return { status: 'waiting_confirmation', workflow, reason: workflow.control.reason || 'workflow 等待确认' };
+    }
+    return null;
   }
 
   async run(workflowOrId) {
@@ -126,6 +190,11 @@ export class WorkflowRunner {
       this.save(workflow);
       return { status: 'waiting_confirmation', workflow };
     }
+    const blocked = this.controlBlockedResult(workflow);
+    if (blocked) {
+      this.save(workflow);
+      return blocked;
+    }
     if (workflow.status === 'pending') {
       workflow = await this.emit({ ...workflow, status: 'running', updatedAt: nowIso() }, {
         type: 'started',
@@ -134,6 +203,11 @@ export class WorkflowRunner {
     }
 
     while (workflow.currentStep < workflow.steps.length) {
+      const blockedInLoop = this.controlBlockedResult(workflow);
+      if (blockedInLoop) {
+        this.save(workflow);
+        return blockedInLoop;
+      }
       const step = workflow.steps[workflow.currentStep];
       if (step.status === 'completed' || step.status === 'skipped') {
         workflow = { ...workflow, currentStep: workflow.currentStep + 1, updatedAt: nowIso() };
@@ -166,6 +240,14 @@ export class WorkflowRunner {
           error: err.message || String(err),
           endedAt: nowIso(),
         });
+        const beforeRecord = workflow;
+        workflow = recordNodeResult(workflow, {
+          stepId: workflow.steps[workflow.currentStep].id,
+          status: 'FAILED',
+          summary: err.message || String(err),
+          concerns: [err.message || String(err)],
+        }).workflow;
+        await this.fanoutGraphProgress(beforeRecord, workflow);
         workflow = await this.emit({ ...workflow, status: 'failed', error: err.message || String(err), updatedAt: nowIso() }, {
           type: 'failed',
           stepId: step.id,
@@ -185,6 +267,11 @@ export class WorkflowRunner {
           ...workflow,
           status: 'waiting_confirmation',
           requiresConfirmation: true,
+          control: {
+            dispatchState: 'awaiting_user_confirmation',
+            reason: String(confirmation.reason || '需要确认后继续'),
+            confirmationConsumed: false,
+          },
           resumeToken: resumeToken(),
           confirmation: {
             stepId: workflow.steps[workflow.currentStep].id,
@@ -206,13 +293,28 @@ export class WorkflowRunner {
       const output = Object.prototype.hasOwnProperty.call(result || {}, 'output') ? result.output : result;
       const merged = mergeStepArtifacts(workflow, workflow.steps[workflow.currentStep].id, result || {});
       workflow = merged.workflow;
+      const nodeResult = nodeResultFromStepResult(workflow.steps[workflow.currentStep], result || {}, merged);
+      const stepStatus = isSuccessfulNodeResultStatus(nodeResult.status) ? 'completed' : 'failed';
       workflow = updateStep(workflow, workflow.currentStep, {
-        status: 'completed',
+        status: stepStatus,
         output: output ?? null,
         artifactIds: [...new Set([...(workflow.steps[workflow.currentStep].artifactIds || []), ...merged.artifactIds])],
         citationIds: [...new Set([...(workflow.steps[workflow.currentStep].citationIds || []), ...merged.citationIds])],
         endedAt: nowIso(),
       });
+      const beforeReconcile = workflow;
+      const reconciled = reconcileNodeResult(workflow, nodeResult);
+      workflow = reconciled.workflow;
+      await this.fanoutGraphProgress(beforeReconcile, workflow);
+      if (reconciled.graphReconcileRequired) {
+        this.save(workflow);
+        return {
+          status: 'awaiting_graph_reconcile',
+          workflow,
+          nodeResult: reconciled.nodeResult,
+          staleStepIds: reconciled.staleStepIds,
+        };
+      }
       workflow = await this.emit(workflow, {
         type: 'step_completed',
         stepId: workflow.steps[workflow.currentStep].id,
@@ -220,6 +322,22 @@ export class WorkflowRunner {
       });
       workflow = { ...workflow, currentStep: workflow.currentStep + 1, updatedAt: nowIso() };
       this.save(workflow);
+    }
+
+    const verdict = evaluateWorkflowCompletion(workflow);
+    if (!verdict.canCompleteWorkflow) {
+      const first = verdict.blockers[0];
+      workflow = setWorkflowControl(workflow, {
+        dispatchState: 'awaiting_graph_reconcile',
+        reason: first?.message || 'workflow completion blocked',
+        confirmationConsumed: true,
+      });
+      workflow = await this.emit(workflow, {
+        type: 'completion_blocked',
+        message: first?.message || 'workflow completion blocked',
+        data: { blockers: verdict.blockers, warnings: verdict.warnings },
+      });
+      return { status: 'completion_blocked', workflow, verdict };
     }
 
     workflow = await this.emit({
@@ -255,9 +373,23 @@ export class WorkflowRunner {
       status: 'running',
       requiresConfirmation: false,
       confirmation: null,
+      control: {
+        dispatchState: 'ready',
+        reason: '',
+        confirmationConsumed: true,
+      },
       currentStep: idx + 1,
       updatedAt: nowIso(),
     };
+    const confirmResult = {
+      stepId: workflow.steps[idx].id,
+      status: 'DONE',
+      summary: `确认完成：${workflow.steps[idx].title}`,
+      gateUpdates: workflow.steps[idx].input?.gateUpdates || workflow.steps[idx].input?.gate_updates || [],
+    };
+    const beforeReconcile = workflow;
+    workflow = reconcileNodeResult(workflow, confirmResult).workflow;
+    await this.fanoutGraphProgress(beforeReconcile, workflow);
     workflow = await this.emit(workflow, {
       type: 'step_completed',
       stepId: workflow.steps[idx].id,

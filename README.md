@@ -37,6 +37,8 @@
 | [src/workflow-schema.mjs](src/workflow-schema.mjs) | Workflow v2 schema：步骤、artifact、citation、progress event 与状态转换 |
 | [src/workflow-runner.mjs](src/workflow-runner.mjs) | Durable workflow runner：顺序推进、确认暂停、恢复、取消、重试 |
 | [src/workflow-control.mjs](src/workflow-control.mjs) | Workflow 与现有审批卡片/确认码通道的适配层 |
+| [src/workflows/doc-report.mjs](src/workflows/doc-report.mjs) | W2 文档报告 worker：来源识别、读取、分块、带引用报告、创建飞书文档、确认后发送链接 |
+| [src/doc-source-parser.mjs](src/doc-source-parser.mjs) / [src/doc-reader.mjs](src/doc-reader.mjs) | 文档链接/token 解析与飞书/wiki/网页只读读取 |
 | [test/](test/) | Node 内置测试：权限、Agent、SSRF、超时、记忆、多模型回归 |
 | [docker/shell-sandbox.Dockerfile](docker/shell-sandbox.Dockerfile) | Shell Docker runner 的默认镜像，内置 Node/npm、Python3、git、ripgrep 等受限工具 |
 | `.local/skills/feishu-skill/` | 本地 lark-cli 技能包目录（被 `.gitignore` 忽略，不随开源代码上传）；仅作为 `lark-cli skills` 不可用时的离线回退 |
@@ -96,7 +98,7 @@
 
 默认使用 `auto`：当群友消息命中数学符号、定理/猜想、证明/证伪、论文、算法等信号时，只对本轮回复临时切到 `academic_serious`；普通问题使用 `daily_assistant`。主人可以通过 `list_personas` 查看人格，通过 `switch_persona` 把当前群或全局默认设置切换为 `auto` 或某个固定人格，也可用 `clear_chat_persona` 清除当前群覆盖。切换人格属于长期配置变更，会弹出确认卡片，确认后才生效；访客不能查看或修改人格配置。人格只影响表达和推理策略，不能改变主人/访客权限、安全策略、数据边界或工具限制。
 
-**Workflow 基础能力**：复杂任务可先落成 durable workflow，再由 runner 按步骤推进。当前已提供主人专属 `start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry` 工具，用于验证计划落盘、确认暂停、确认后恢复、取消和失败重试。workflow 确认复用现有确认卡片/确认码通道；文档总结、会议安排、数据分析等业务 worker 会在后续迭代接入。
+**Workflow 基础能力**：复杂任务可先落成 durable workflow，再由 runner 按步骤推进。当前已提供主人专属 `start_workflow`、`workflow_status`、`workflow_cancel`、`workflow_retry` 工具，用于计划落盘、确认暂停、确认后恢复、取消和失败重试。`doc_report` 已接入 W2 worker：用户给飞书文档/wiki/ByteTech 链接后，可识别来源、读取内容、分块建 citation、生成较完整的带引用报告草稿，创建飞书文档，并在确认后把文档链接发送到当前会话；后续会议安排、数据分析等业务 worker 仍在迭代中。
 
 > **提示**：日历/任务/邮件工具走 `--as user`，需主人先给对应 scope 授权（如日程查看/创建/删除分别需要 `calendar:calendar.event:read`、`calendar:calendar.event:create`、`calendar:calendar.event:delete`）。未授权时工具会**如实返回授权错误**并转达给你，绝不编造结果。
 
@@ -214,7 +216,7 @@ tail -f /tmp/larkbot.log
 | `CURRENT_MESSAGE_IMAGE_LIMIT` | 多模态 | 当前 @ 消息或私聊消息里最多识别多少张图片，默认 3 |
 | `RATE_MAX_PER_SENDER` / `RATE_WINDOW_MS` / `MAX_CONCURRENT` | 限流 | 访客限流与并发 |
 | `CONFIRM_TTL_MS` | 安全 | 写操作确认超时，默认 5 分钟 |
-| `SECURITY_REFUSAL_STYLE` | 安全 | 访客高风险请求的拒绝语气：`teasing`（默认，轻微挑衅）/ `firm`（严肃） |
+| `SECURITY_REFUSAL_STYLE` | 安全 | 高风险请求的拒绝语气：`firm`（默认，严肃）/ `teasing`（保留兼容，不建议生产使用） |
 | `RESOLVE_VISITOR` | 访客 | 设 `off` 关闭访客身份解析 |
 | `AGENT_MAX_ITERS` / `AGENT_MAX_TOOL_CALLS` | Agent | 最大图迭代（默认 6）/ 单次请求工具调用预算（默认 10） |
 | `MULTI_REPLY_ENABLED` / `MULTI_REPLY_MAX_PARTS` | 体验 | 是否允许普通回答拆成多条飞书回复（默认 `on`）/ 最多拆分条数（默认 3） |

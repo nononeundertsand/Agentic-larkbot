@@ -1,4 +1,4 @@
-const DEFAULT_STYLE = (process.env.SECURITY_REFUSAL_STYLE || 'teasing').toLowerCase();
+const DEFAULT_STYLE = (process.env.SECURITY_REFUSAL_STYLE || 'firm').toLowerCase();
 
 const RISK_TYPES = [
   {
@@ -108,7 +108,7 @@ export function formatSafetyRefusal({ text = '', reason = '', ownerName = '主�
     : '这条请求已被安全策略拦下。';
   const tail = style === 'firm'
     ? '如需正常协助，请换成不涉及越权、凭证或本机数据读取的请求。'
-    : '换个正常问题我会继续答；这种越权路线就别浪费轮次了。';
+    : '如需继续，请把目标、授权范围和要处理的资源说清楚。';
 
   return [
     header,

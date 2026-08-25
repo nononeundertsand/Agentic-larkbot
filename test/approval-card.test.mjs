@@ -6,6 +6,8 @@ import {
   APPROVAL_CARD_ACTION,
   buildApprovalCard,
   buildApprovalStatusCard,
+  buildWorkflowStatusCard,
+  extractApprovalActionPayload,
   parseApprovalActionValue,
 } from '../src/approval-card.mjs';
 
@@ -87,4 +89,56 @@ test('状态卡片会禁用交互并展示处理结果', () => {
   assert.equal(card.header.template, 'green');
   assert.equal(card.body.elements.some((item) => JSON.stringify(item).includes('确认执行')), false);
   assert.match(JSON.stringify(card), /已执行/);
+});
+
+test('状态卡片支持执行中反馈', () => {
+  const card = buildApprovalStatusCard(action, { status: 'running', detail: '已确认，正在执行该操作。' });
+  assert.equal(card.header.template, 'blue');
+  assert.match(JSON.stringify(card), /执行中/);
+  assert.match(JSON.stringify(card), /正在执行/);
+});
+
+test('工作流状态卡片展示任务进度', () => {
+  const card = buildWorkflowStatusCard({
+    workflowId: 'wf_1',
+    title: '文档报告',
+    status: 'running',
+    currentStep: 1,
+    steps: [
+      { id: 'read', title: '读取文档', status: 'completed' },
+      { id: 'draft', title: '生成报告', status: 'running' },
+    ],
+    gates: [{ id: 'gate_doc', title: '文档已读取', status: 'passed' }],
+  }, { event: { type: 'step_started', message: '开始：生成报告' } });
+
+  const serialized = JSON.stringify(card);
+  assert.equal(card.header.template, 'blue');
+  assert.match(serialized, /工作流执行中/);
+  assert.match(serialized, /步骤 1\/2/);
+  assert.match(serialized, /生成报告/);
+});
+
+test('卡片事件 payload 支持多种嵌套形态', () => {
+  const payload = extractApprovalActionPayload({
+    data: {
+      event: {
+        action: {
+          value: {
+            source: APPROVAL_CARD_ACTION,
+            decision: 'confirm',
+            confirmationKey: 'p:owner',
+            actionId: 'act_1',
+            confirmToken: 'ABC123',
+          },
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(payload, {
+    decision: 'confirm',
+    confirmationKey: 'p:owner',
+    actionId: 'act_1',
+    confirmToken: 'ABC123',
+  });
 });

@@ -41,6 +41,7 @@ import {
   buildWorkflowApprovalAction,
   createRuntimeWorkflowRunner,
   createWorkflowFromRequest,
+  ensureWorkflowPlanCurrent,
   formatWorkflowForUser,
   formatWorkflowRunResult,
   workflowSummary,
@@ -1861,8 +1862,9 @@ const TOOLS = [
     name: 'start_workflow',
     description:
       '把一个复杂多步骤目标创建为本地持久化 workflow 并立即推进到完成、失败或等待确认。' +
-      '当前用于 durable workflow 生命周期：计划落盘、步骤推进、确认暂停和恢复；不会自动执行真实飞书写操作。' +
-      '当用户明确要求“按 workflow/复杂任务/可恢复任务处理”时使用；普通问答不要调用。',
+      '当前支持 durable workflow 生命周期：计划落盘、步骤推进、确认暂停和恢复。' +
+      '当 workflow_type=doc_report 且用户给出飞书文档/wiki/ByteTech 链接时，会使用 W2 文档报告 worker 读取、分块、生成带引用报告；发送前必须确认。' +
+      '当用户明确要求“按 workflow/复杂任务/长任务/可恢复任务处理”，或要求总结多个文档并生成报告时使用；普通问答不要调用。',
     parameters: {
       type: 'object',
       properties: {
@@ -1882,14 +1884,33 @@ const TOOLS = [
               id: { type: 'string', description: '步骤 id，可选；建议英文小写加下划线' },
               type: { type: 'string', enum: ['plan', 'tool', 'transform', 'verify', 'confirm', 'send'], description: '步骤类型' },
               title: { type: 'string', description: '步骤标题' },
+              depends: { type: 'array', items: { type: 'string' }, description: '依赖的步骤 id，可选' },
+              gate_ids: { type: 'array', items: { type: 'string' }, description: '该步骤关联的 Gate id，可选' },
+              acceptance: { type: 'string', description: '该步骤完成验收口径，可选' },
               input: { type: 'object', additionalProperties: true, description: '步骤输入，可选' },
             },
             required: ['type', 'title'],
           },
           description: '结构化步骤。需要人工确认时包含一个 type=confirm 的步骤。',
         },
+        gates: {
+          type: 'array',
+          maxItems: 12,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Gate id，建议英文小写加下划线' },
+              title: { type: 'string', description: 'Gate 标题' },
+              acceptance: { type: 'string', description: 'Gate 通过标准' },
+              required_evidence: { type: 'array', items: { type: 'string' }, description: '需要的证据类型或证据标签' },
+            },
+            required: ['id', 'title'],
+          },
+          description: '可选验收 Gate。未提供时按步骤完成作为最低完成条件。',
+        },
         require_confirmation: { type: 'boolean', description: '为 true 时若 steps 中没有 confirm，会自动追加确认步骤' },
         confirmation_message: { type: 'string', description: '确认步骤展示给用户的确认内容' },
+        target_chars: { type: 'number', minimum: 500, maximum: 12000, description: '报告目标长度，doc_report 可选，默认约 1200 字以上' },
       },
       required: ['user_goal'],
     },
@@ -1899,8 +1920,10 @@ const TOOLS = [
       user_goal,
       workflow_type = 'generic',
       steps = [],
+      gates = [],
       require_confirmation = false,
       confirmation_message = '',
+      target_chars,
     }, ctx) {
       const stateStore = ctx.stateStore;
       if (!stateStore?.saveWorkflow || !stateStore?.getWorkflow) {
@@ -1913,13 +1936,22 @@ const TOOLS = [
         sessionKey: ctx.sessionKey || (ctx.chatId ? `g:${ctx.chatId}:${ctx.senderId || 'unknown'}` : `p:${ctx.senderId || 'unknown'}`),
         ownerId: ctx.senderId || '',
         steps,
+        gates,
         requireConfirmation: Boolean(require_confirmation),
         confirmationMessage: confirmation_message,
+        metadata: {
+          deliveryChatId: ctx.chatId || '',
+          deliveryMode: ctx.chatId ? 'chat' : 'artifact_only',
+          requestedMessageId: ctx.messageId || '',
+          targetChars: Number(target_chars) || undefined,
+        },
       });
       stateStore.saveWorkflow(workflow);
       const runner = createRuntimeWorkflowRunner({
         stateStore,
         progressSink: ctx.workflowProgressSink,
+        workflow,
+        ctx,
       });
       const result = await runner.run(workflow.workflowId);
       if (result.status === 'waiting_confirmation') {
@@ -2025,15 +2057,39 @@ const TOOLS = [
       if (!stateStore?.getWorkflow || !stateStore?.saveWorkflow) {
         return { error: '运行态状态存储不可用，无法重试 workflow' };
       }
-      const workflow = stateStore.getWorkflow(workflow_id);
+      let workflow = stateStore.getWorkflow(workflow_id);
       if (!workflow) return { error: `未找到 workflow：${workflow_id}` };
-      const stepRef = step_id || workflow.steps?.find((step) => step.status === 'failed')?.id || workflow.steps?.[workflow.currentStep]?.id;
+      workflow = ensureWorkflowPlanCurrent(workflow);
+      stateStore.saveWorkflow(workflow);
+      const failedStepId = workflow.steps?.find((step) => step.status === 'failed')?.id || '';
+      const stepRef = step_id
+        || (workflow.type === 'doc_report' && failedStepId === 'read_documents' ? 'extract_sources' : '')
+        || failedStepId
+        || workflow.steps?.[workflow.currentStep]?.id;
       if (!stepRef) return { error: '没有可重试的 workflow 步骤' };
       const runner = createRuntimeWorkflowRunner({
         stateStore,
         progressSink: ctx.workflowProgressSink,
+        workflow,
+        ctx,
       });
       const result = await runner.retry(workflow_id, stepRef, { reason });
+      if (result.status === 'waiting_confirmation') {
+        if (typeof ctx.registerPendingWrite !== 'function') {
+          return { error: 'workflow 已进入等待确认，但当前入口不支持登记确认动作', workflowId: result.workflow.workflowId };
+        }
+        const action = buildWorkflowApprovalAction(result.workflow, {
+          confirmationKey: ctx.confirmationKey || '',
+        });
+        ctx.registerPendingWrite(action);
+        return {
+          needConfirm: true,
+          actionId: action.id,
+          confirmToken: action.confirmToken,
+          workflowId: result.workflow.workflowId,
+          message: action.preview,
+        };
+      }
       return { workflow: workflowSummary(result.workflow), message: formatWorkflowRunResult(result) };
     },
   },

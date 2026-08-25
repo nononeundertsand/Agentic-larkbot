@@ -45,12 +45,114 @@ test('workflow runner 可执行 fake plan/tool/transform/verify/send 并持久�
     assert.equal(result.status, 'completed');
     assert.equal(result.workflow.artifacts.a_doc.title, '材料摘录');
     assert.equal(result.workflow.citations.c_doc.type, 'doc');
+    assert.equal(Object.keys(result.workflow.nodeResults).length, 5);
+    assert.equal(result.workflow.steps[1].nodeResultIds.length, 1);
     assert.ok(events.some((event) => event.type === 'step_started' && event.stepId === 'tool'));
+    assert.ok(events.some((event) => event.type === 'node_result_recorded' && event.stepId === 'tool'));
     assert.ok(events.some((event) => event.type === 'completed'));
 
     const restored = new RuntimeStateStore({ file }).getWorkflow(workflow.workflowId);
     assert.equal(restored.status, 'completed');
     assert.equal(restored.steps.every((step) => step.status === 'completed'), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workflow runner 会用 Gate completion policy 阻止未验收 workflow 完成', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-workflow-gate-block-'));
+  const file = join(dir, 'state.json');
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const workflow = createWorkflow({
+      title: '缺少引用检查',
+      steps: [{ id: 'write', type: 'transform', title: '写报告' }],
+      gates: [{ id: 'gate_citations', title: '引用完整', acceptance: '必须有引用', requiredEvidence: ['citation_coverage'] }],
+    });
+    stateStore.saveWorkflow(workflow);
+    const runner = createWorkflowRunner({
+      stateStore,
+      handlers: {
+        transform: async () => ({ output: { draft: true } }),
+      },
+    });
+
+    const result = await runner.run(workflow.workflowId);
+    assert.equal(result.status, 'completion_blocked');
+    assert.equal(result.workflow.status, 'running');
+    assert.equal(result.workflow.control.dispatchState, 'awaiting_graph_reconcile');
+    assert.equal(result.verdict.blockers.some((item) => item.code === 'gate_not_passed'), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workflow runner 支持 handler 返回 NodeResult 更新 Gate 后完成', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-workflow-gate-pass-'));
+  const file = join(dir, 'state.json');
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const workflow = createWorkflow({
+      title: '引用检查通过',
+      steps: [{ id: 'verify', type: 'verify', title: '检查引用', gateIds: ['gate_citations'] }],
+      gates: [{ id: 'gate_citations', title: '引用完整', acceptance: '必须有引用', requiredEvidence: ['citation_coverage'] }],
+    });
+    stateStore.saveWorkflow(workflow);
+    const runner = createWorkflowRunner({
+      stateStore,
+      handlers: {
+        verify: async () => ({
+          output: { ok: true },
+          nodeResult: {
+            status: 'DONE',
+            summary: '引用检查通过',
+            citationIds: ['c1'],
+            gateUpdates: [{ gateId: 'gate_citations', status: 'passed', evidenceRefs: ['citation:c1'] }],
+          },
+        }),
+      },
+    });
+
+    const result = await runner.run(workflow.workflowId);
+    assert.equal(result.status, 'completed');
+    assert.equal(result.workflow.gates[0].status, 'passed');
+    assert.equal(result.workflow.gates[0].passedByNodeResultId, result.workflow.steps[0].nodeResultIds[0]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workflow runner 遇到失败 NodeResult 会停在 graph reconcile barrier', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'larkbot-workflow-reconcile-'));
+  const file = join(dir, 'state.json');
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const workflow = createWorkflow({
+      title: '读取失败后停止下游',
+      steps: [
+        { id: 'read', type: 'tool', title: '读取文档' },
+        { id: 'write', type: 'transform', title: '写报告', depends: ['read'] },
+      ],
+    });
+    stateStore.saveWorkflow(workflow);
+    const runner = createWorkflowRunner({
+      stateStore,
+      handlers: {
+        tool: async () => ({
+          output: { ok: false },
+          nodeResult: { status: 'FAILED', summary: '读取失败' },
+        }),
+        transform: async () => {
+          throw new Error('下游不应执行');
+        },
+      },
+    });
+
+    const result = await runner.run(workflow.workflowId);
+    assert.equal(result.status, 'awaiting_graph_reconcile');
+    assert.deepEqual(result.staleStepIds, ['write']);
+    assert.equal(result.workflow.steps[1].status, 'pending');
+    assert.equal(result.workflow.control.dispatchState, 'awaiting_graph_reconcile');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

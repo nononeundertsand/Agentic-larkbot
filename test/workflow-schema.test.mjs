@@ -6,7 +6,9 @@ import {
   appendWorkflowProgress,
   createArtifact,
   createCitation,
+  createNodeResult,
   createWorkflowV2,
+  createWorkflowGate,
   markWorkflowCanceled,
   markWorkflowRetry,
   normalizeWorkflow,
@@ -30,8 +32,12 @@ test('workflow v2 schema 创建时包含 artifact/citation/progress 基础字段
   assert.deepEqual(workflow.plan.missingInputs, ['文档链接']);
   assert.deepEqual(workflow.artifacts, {});
   assert.deepEqual(workflow.citations, {});
+  assert.deepEqual(workflow.gates, []);
+  assert.deepEqual(workflow.nodeResults, {});
+  assert.equal(workflow.control.dispatchState, 'ready');
   assert.equal(workflow.steps[0].artifactIds.length, 0);
   assert.equal(workflow.steps[0].citationIds.length, 0);
+  assert.equal(workflow.steps[0].nodeResultIds.length, 0);
   assert.equal(workflow.progressEvents[0].type, 'created');
 });
 
@@ -52,7 +58,39 @@ test('workflow v1 数据可规范化为 v2 并保留原字段', () => {
   assert.equal(workflow.workflowId, 'wf_old');
   assert.equal(workflow.steps[0].id, 'send');
   assert.equal(workflow.resumeToken, 'ABC');
+  assert.deepEqual(workflow.gates, []);
+  assert.deepEqual(workflow.nodeResults, {});
+  assert.equal(workflow.control.dispatchState, 'ready');
   assert.equal(workflow.progressEvents[0].message, 'workflow v1 migrated to v2');
+});
+
+test('workflow schema 支持 Gate 和 NodeResult 兼容扩展字段', () => {
+  const gate = createWorkflowGate({
+    id: 'gate_citations',
+    title: '引用完整',
+    acceptance: '每条结论都有 citation',
+    requiredEvidence: ['citation_coverage'],
+  });
+  const nodeResult = createNodeResult({
+    id: 'result_read',
+    stepId: 'read',
+    status: 'DONE_WITH_CONCERNS',
+    summary: '读取完成但有一个来源缺权限',
+    concerns: ['doc_c 无权限'],
+    citationIds: ['c1'],
+  });
+  const workflow = createWorkflowV2({
+    steps: [{ id: 'read', type: 'tool', depends: ['plan'], gateIds: ['gate_citations'], nodeResultIds: ['result_read'] }],
+    gates: [gate],
+    nodeResults: { result_read: nodeResult },
+    control: { dispatchState: 'awaiting_graph_reconcile', reason: '需要补证据' },
+  });
+
+  assert.equal(workflow.steps[0].depends[0], 'plan');
+  assert.equal(workflow.steps[0].gateIds[0], 'gate_citations');
+  assert.equal(workflow.gates[0].requiredEvidence[0], 'citation_coverage');
+  assert.equal(workflow.nodeResults.result_read.status, 'DONE_WITH_CONCERNS');
+  assert.equal(workflow.control.dispatchState, 'awaiting_graph_reconcile');
 });
 
 test('artifact 和 citation 可写入 workflow', () => {

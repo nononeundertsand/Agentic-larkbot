@@ -269,6 +269,14 @@ test('lark-cli 子进程有超时保护', async () => {
   assert.ok(Date.now() - started < 800);
 });
 
+test('lark-cli 子进程支持 stdin 输入', async () => {
+  process.env.LARK_CLI_BIN = '/bin/cat';
+  const { runLark } = await import(`../src/lark.mjs?stdin=${Date.now()}`);
+  const result = await runLark([], { input: 'hello from stdin' });
+  assert.equal(result.code, 0);
+  assert.equal(result.out, 'hello from stdin');
+});
+
 test('记忆首轮即创建私有 profile，场景文件使用原子写入', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'larkbot-memory-test-'));
   process.env.MEMORY_DATA_DIR = dir;

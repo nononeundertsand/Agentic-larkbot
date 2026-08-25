@@ -1,0 +1,23 @@
+{
+  "type": "doc_report",
+  "title": "文档总结报告",
+  "userGoal": "总结用户提供的飞书文档，生成带引用报告文档，并在发送文档链接前等待确认。",
+  "steps": [
+    "extract_sources",
+    "read_documents",
+    "chunk_documents",
+    "draft_report",
+    "verify_citations",
+    "create_report_document",
+    "confirm_delivery",
+    "send_or_save"
+  ],
+  "gates": [
+    "gate_sources_identified",
+    "gate_documents_read",
+    "gate_report_citations",
+    "gate_report_draft_ready",
+    "gate_report_document_created",
+    "gate_delivery_confirmed"
+  ]
+}
