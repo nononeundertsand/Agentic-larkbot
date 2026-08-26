@@ -34,6 +34,27 @@ test('模糊同意词不会触发写操作，新请求会作废旧审批', () =>
   assert.equal(store.size(), 0);
 });
 
+test('workflow 等待确认时查询状态不会隐式取消审批', () => {
+  const store = new ApprovalStore({ ttlMs: 10000 });
+  store.register('g:group:owner', {
+    id: 'wf_action',
+    toolName: 'workflow_approval',
+    executor: 'workflow',
+    workflow: { workflowId: 'wf_123' },
+    preview: '确认发送报告',
+    confirmToken: 'WF1234',
+  });
+
+  const statusQuery = store.resolve('g:group:owner', 'workflow_status 查询进度 ID：wf_123', { isOwner: true });
+  assert.equal(statusQuery.kind, 'none');
+  assert.equal(store.size(), 1);
+
+  const confirm = store.resolve('g:group:owner', '确认 WF1234', { isOwner: true });
+  assert.equal(confirm.kind, 'execute');
+  assert.equal(confirm.action.workflow.workflowId, 'wf_123');
+  assert.equal(store.size(), 0);
+});
+
 test('审批状态机支持 Shell executor 动作', () => {
   const store = new ApprovalStore({ ttlMs: 10000 });
   store.register('p:owner', {

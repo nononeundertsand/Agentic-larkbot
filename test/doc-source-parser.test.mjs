@@ -35,3 +35,19 @@ test('文档来源解析能处理中文连接词粘连的多个 URL', () => {
   assert.equal(sources[0].url, 'https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh');
   assert.equal(sources[1].token, 'doxcnJ2BghGgHIIKKQlax7sxkbf');
 });
+
+test('文档来源解析支持用户换行反引号包裹的 ByteTech 与 wiki 链接', () => {
+  const sources = extractDocSources(
+    '帮我总结这几个飞书文档，生成带引用报告飞书文档，文档链接为：\n' +
+      '`https://bytetech.info/articles/7654024985686016040?from=message_bot&sender_type=101&message_id=7677790739543670794&column=like#ZmXjdv1HVoOf2GxJCNyctUSpn3f`\n\n' +
+      '`https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh`',
+  );
+
+  assert.equal(sources.length, 2);
+  assert.equal(sources[0].kind, 'web');
+  assert.equal(sources[0].reader, 'web');
+  assert.match(sources[0].url, /bytetech\.info\/articles\/7654024985686016040/);
+  assert.equal(sources[1].kind, 'wiki');
+  assert.equal(sources[1].reader, 'lark_wiki');
+  assert.equal(sources[1].token, 'LpxGwSMfDiZwAkkztg2crzoPnQh');
+});

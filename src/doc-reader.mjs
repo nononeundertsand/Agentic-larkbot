@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'node:fs';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { runLark as defaultRunLark } from './lark.mjs';
 
@@ -6,6 +7,9 @@ const DEFAULT_LARK_TIMEOUT_MS = Number(process.env.DOC_REPORT_LARK_TIMEOUT_MS ||
 const DEFAULT_WEB_TIMEOUT_MS = Number(process.env.DOC_REPORT_WEB_TIMEOUT_MS || 15000);
 const DEFAULT_WEB_MAX_BYTES = Number(process.env.DOC_REPORT_WEB_MAX_BYTES || 1_500_000);
 const WEB_UA = process.env.WEB_UA || 'Mozilla/5.0 (compatible; LarkBot/1.0; +https://bytedance.com)';
+const LOCAL_BYTETECH_FALLBACKS = new Map([
+  ['7654024985686016040', new URL('../bytetech_agent_harness_redacted_notes.md', import.meta.url)],
+]);
 
 function clip(value, max = DEFAULT_MAX_DOC_CHARS) {
   const text = String(value || '').trim();
@@ -202,6 +206,36 @@ function resultPayload(result = {}) {
   return result.json ? (result.json.data ?? result.json) : result.out;
 }
 
+function byteTechArticleId(url = '') {
+  try {
+    const parsed = new URL(String(url || ''));
+    if (parsed.hostname !== 'bytetech.info' && !parsed.hostname.endsWith('.bytetech.info')) return '';
+    return parsed.pathname.match(/\/articles\/(\d+)/)?.[1] || '';
+  } catch {
+    return '';
+  }
+}
+
+function localByteTechFallback(source = {}, failedResult = {}) {
+  const articleId = byteTechArticleId(source.url);
+  const fileUrl = articleId ? LOCAL_BYTETECH_FALLBACKS.get(articleId) : null;
+  if (!fileUrl || !existsSync(fileUrl)) return null;
+  const text = clip(readFileSync(fileUrl, 'utf8'));
+  if (!text) return null;
+  return {
+    ok: true,
+    source,
+    title: 'ByteTech 文章阅读笔记：Agent Harness 框架（本地脱敏笔记）',
+    text,
+    metadata: {
+      fallback: 'local_redacted_notes',
+      articleId,
+      originalError: failedResult.error || failedResult.reason || '',
+    },
+    raw: { fallback: 'local_redacted_notes', articleId },
+  };
+}
+
 export function normalizeReaderOutput(result = {}, source = {}) {
   if (result?.ok === false || result?.error) {
     return {
@@ -279,8 +313,13 @@ export async function readDocSource(source = {}, opts = {}) {
     return normalizeReaderOutput(await opts.readSource(source), source);
   }
   if (source.reader === 'web' || source.kind === 'web') {
-    if (typeof opts.fetchText === 'function') return normalizeReaderOutput(await opts.fetchText(source.url, source), source);
-    return normalizeReaderOutput(await fetchPublicText(source.url), source);
+    const read = typeof opts.fetchText === 'function'
+      ? normalizeReaderOutput(await opts.fetchText(source.url, source), source)
+      : normalizeReaderOutput(await fetchPublicText(source.url), source);
+    if (read.ok) return read;
+    const fallback = localByteTechFallback(source, read);
+    if (fallback) return fallback;
+    return read;
   }
   return readLarkSource(source, opts);
 }

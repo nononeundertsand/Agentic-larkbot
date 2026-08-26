@@ -68,3 +68,19 @@ test('doc-reader 使用 docs +fetch v2 参数读取完整文档', async () => {
   assert.deepEqual(calls[0], ['docs', '+fetch', '--doc', 'doxcnABCDEF123456', '--as', 'user', '--scope', 'full', '--doc-format', 'markdown', '--format', 'json']);
   assert.match(result.text, /完整文档内容/);
 });
+
+test('doc-reader 读取已知 ByteTech 文章失败时使用本地脱敏笔记兜底', async () => {
+  const result = await readDocSource({
+    id: 'source_1',
+    kind: 'web',
+    reader: 'web',
+    url: 'https://bytetech.info/articles/7654024985686016040?from=message_bot',
+  }, {
+    fetchText: async () => ({ ok: false, error: '重定向次数过多' }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.metadata.fallback, 'local_redacted_notes');
+  assert.match(result.title, /ByteTech/);
+  assert.match(result.text, /Agent Harness/);
+});

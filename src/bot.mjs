@@ -393,9 +393,53 @@ async function replyApprovalCard(messageId, action) {
   return ok;
 }
 
-async function updateCardToApproval(token, action) {
-  if (!token || !action) return false;
+function extractMessageId(result = {}) {
+  const data = result.json?.data || {};
+  return String(findMessageId(data) || findMessageId(result.json) || '');
+}
+
+function findMessageId(value, depth = 0) {
+  if (!value || depth > 5) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findMessageId(item, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+  for (const key of ['message_id', 'messageId', 'open_message_id', 'openMessageId']) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  for (const item of Object.values(value)) {
+    const found = findMessageId(item, depth + 1);
+    if (found) return found;
+  }
+  return '';
+}
+
+async function patchInteractiveMessage(messageId, card, label = '卡片') {
+  if (!messageId || !card) return false;
+  const r = await runLark([
+    'api', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+    '--as', 'bot',
+    '--data', JSON.stringify({ content: JSON.stringify(card) }),
+  ]);
+  const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
+  if (!ok) console.error(`[card] ❌ PATCH ${label}失败 message=${messageId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
+  return ok;
+}
+
+async function updateCardToApproval(handle, action) {
+  if (!handle || !action) return false;
   const card = buildApprovalCard(action, { ttlMs: CONFIRM_TTL_MS });
+  if (handle.messageId && await patchInteractiveMessage(handle.messageId, card, '工作流确认卡片')) {
+    console.log('[card] ✅ 已将工作流状态卡片 PATCH 为确认卡片');
+    return true;
+  }
+  const token = typeof handle === 'string' ? handle : handle.token;
+  if (!token) return false;
   const r = await runLark([
     'api', 'POST', '/open-apis/interactive/v1/card/update',
     '--as', 'bot',
@@ -422,15 +466,28 @@ async function updateApprovalCard(token, action, { status, detail }) {
 
 function extractCardToken(result = {}) {
   const data = result.json?.data || {};
-  return String(
-    data.token
-    || data.card_token
-    || data.cardToken
-    || data.message?.token
-    || data.message?.card_token
-    || data.message?.cardToken
-    || '',
-  );
+  return String(findCardToken(data) || findCardToken(result.json) || '');
+}
+
+function findCardToken(value, depth = 0) {
+  if (!value || depth > 5) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findCardToken(item, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+  for (const key of ['token', 'card_token', 'cardToken']) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  for (const item of Object.values(value)) {
+    const found = findCardToken(item, depth + 1);
+    if (found) return found;
+  }
+  return '';
 }
 
 async function replyWorkflowStatusCard(messageId, workflow, event = {}, { detail = '' } = {}) {
@@ -446,7 +503,23 @@ async function replyWorkflowStatusCard(messageId, workflow, event = {}, { detail
   const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
   if (ok) console.log(`[reply] ✅ 已回复工作流状态卡片 ${messageId}`);
   else console.error(`[reply] ❌ 工作流状态卡片发送失败 ${messageId} (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
-  return { ok, token: ok ? extractCardToken(r) : '' };
+  return { ok, token: ok ? extractCardToken(r) : '', messageId: ok ? extractMessageId(r) : '' };
+}
+
+async function updateWorkflowStatusCard(handle, workflow, event = {}, { detail = '' } = {}) {
+  if (!handle || !workflow) return false;
+  const card = buildWorkflowStatusCard(workflow, { event, detail });
+  if (handle.messageId && await patchInteractiveMessage(handle.messageId, card, '工作流状态卡片')) return true;
+  const token = typeof handle === 'string' ? handle : handle.token;
+  if (!token) return false;
+  const r = await runLark([
+    'api', 'POST', '/open-apis/interactive/v1/card/update',
+    '--as', 'bot',
+    '--data', JSON.stringify({ token, card }),
+  ]);
+  const ok = r.code === 0 && (r.json ? r.json.ok !== false : true);
+  if (!ok) console.error(`[card] ❌ 更新工作流状态卡片失败 (code=${r.code}): ${r.err.trim() || r.out.trim()}`);
+  return ok;
 }
 
 function approvalStatusFromDetail(detail = '') {
@@ -454,6 +527,43 @@ function approvalStatusFromDetail(detail = '') {
   if (/^(执行失败|工作流执行失败|工作流需要重新规划|工作流暂未完成)/.test(text)) return 'failed';
   if (/^工作流已取消/.test(text)) return 'canceled';
   return 'success';
+}
+
+function shouldReplyWorkflowProgressFallback(event = {}) {
+  return new Set([
+    'started',
+    'waiting_confirmation',
+    'graph_reconcile_required',
+    'completion_blocked',
+    'failed',
+    'canceled',
+    'completed',
+  ]).has(String(event.type || ''));
+}
+
+function statusCardHandleFor(workflow = {}, local = {}) {
+  const stored = workflow.metadata?.statusCard || {};
+  return {
+    token: local.token || stored.token || '',
+    messageId: local.messageId || stored.messageId || '',
+  };
+}
+
+function rememberWorkflowStatusCard(workflow = {}, sent = {}, originalMessageId = '', stateStore = null) {
+  const token = sent.token || '';
+  const messageId = sent.messageId || '';
+  if (!workflow || (!token && !messageId)) return;
+  workflow.metadata = {
+    ...(workflow.metadata || {}),
+    statusCard: {
+      ...(workflow.metadata?.statusCard || {}),
+      token,
+      messageId,
+      originalMessageId,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  stateStore?.saveWorkflow?.(workflow);
 }
 
 async function executePendingApproval(pending) {
@@ -669,6 +779,9 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
   let registeredAction = null;
   let workflowStatusCardSent = false;
   let workflowStatusCardToken = '';
+  let workflowStatusCardMessageId = '';
+  let workflowCardUpdateUnavailable = false;
+  let lastWorkflowProgressText = '';
   const personaDecision = ctx.personaDecision || resolvePersonaForMessage(text, {
     chatId: ctx.chatId || '',
     personaState: stateStore.getPersonaState(),
@@ -694,16 +807,50 @@ async function runAgentWithConfirm(text, ctx, confirmationKey, isOwner) {
     confirmationKey,
     workflowProgressSink: ctx.messageId
       ? async (event, workflow) => {
+        const detail = event.type === 'started'
+          ? '任务已进入 workflow runtime，后续关键步骤会继续在这张卡片内更新。'
+          : '';
         if (!workflowStatusCardSent && event.type === 'started') {
-          const sent = await replyWorkflowStatusCard(ctx.messageId, workflow, event, {
-            detail: '任务已进入 workflow runtime，后续关键步骤会继续同步。',
-          });
+          const sent = await replyWorkflowStatusCard(ctx.messageId, workflow, event, { detail });
           workflowStatusCardSent = Boolean(sent.ok);
           workflowStatusCardToken = sent.token || '';
+          workflowStatusCardMessageId = sent.messageId || '';
+          rememberWorkflowStatusCard(workflow, sent, ctx.messageId, stateStore);
+          if (workflowStatusCardSent && !workflowStatusCardToken && !workflowStatusCardMessageId) {
+            console.warn(`[workflow-card] 状态卡片已发送但未返回可更新标识 workflow=${workflow.workflowId || ''}`);
+          }
           if (workflowStatusCardSent) return;
         }
+        const workflowCardHandle = statusCardHandleFor(workflow, {
+          token: workflowStatusCardToken,
+          messageId: workflowStatusCardMessageId,
+        });
+        if ((workflowCardHandle.messageId || workflowCardHandle.token) && !workflowCardUpdateUnavailable) {
+          const updated = await updateWorkflowStatusCard(workflowCardHandle, workflow, event, { detail });
+          if (updated) return;
+          workflowCardUpdateUnavailable = true;
+        }
+        if (!shouldReplyWorkflowProgressFallback(event)) return;
         const progress = formatWorkflowProgressMessage(event, workflow);
-        if (progress) await replyMessage(ctx.messageId, progress);
+        if (progress && progress !== lastWorkflowProgressText) {
+          lastWorkflowProgressText = progress;
+          await replyMessage(ctx.messageId, progress);
+        }
+      }
+      : null,
+    workflowApprovalSink: ctx.messageId
+      ? async (action) => {
+        const registered = approvals.register(action?.confirmationKey || confirmationKey, {
+          ...action,
+          messageId: action?.messageId || ctx.messageId || '',
+        });
+        const switched = await updateCardToApproval(statusCardHandleFor(action.workflow || {}, {
+          token: workflowStatusCardToken,
+          messageId: workflowStatusCardMessageId,
+        }), registered);
+        if (switched) return;
+        const cardSent = await replyApprovalCard(ctx.messageId, registered);
+        if (!cardSent) await replyMessage(ctx.messageId, registered.preview);
       }
       : null,
     registerPendingWrite: (action) => {
@@ -936,6 +1083,7 @@ async function handleEvent(evt) {
       senderName,
       senderDept: senderProfile?.department || '',
       chatId: '',
+      messageId,
       sessionKey: pKey.id,
       ownerConfirmationKey: OWNER_OPEN_ID ? `p:${OWNER_OPEN_ID}` : '',
       personaDecision,

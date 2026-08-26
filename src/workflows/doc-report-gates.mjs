@@ -18,7 +18,7 @@ export function defaultDocReportGates() {
     {
       id: DOC_REPORT_GATES.documentsRead,
       title: '文档已读取',
-      acceptance: '每个来源都读取成功，或读取失败已记录为结构化失败证据。',
+      acceptance: '默认必须每个来源都读取成功；只有显式允许部分结果时，读取失败才可作为结构化失败证据继续。',
       requiredEvidence: ['artifact:doc_contents'],
     },
     {

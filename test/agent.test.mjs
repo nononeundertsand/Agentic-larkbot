@@ -72,7 +72,8 @@ test('文档总结请求会确定性路由到 doc_report workflow', async () => 
   assert.equal(executed.length, 1);
   assert.equal(executed[0].name, 'start_workflow');
   assert.equal(executed[0].args.workflow_type, 'doc_report');
-  assert.equal(executed[0].args.target_chars, 1800);
+  assert.equal(executed[0].args.target_chars, 4500);
+  assert.equal(executed[0].args.run_async, true);
 });
 
 test('普通网页总结不会被强制路由到 doc_report workflow', async () => {

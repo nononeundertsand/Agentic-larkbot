@@ -54,6 +54,70 @@ const SKILL_ROOT = resolve(process.env.FEISHU_SKILL_ROOT || join(__dirname, '..'
 const AUTH_CARD_FLOW = join(SKILL_ROOT, 'scripts', 'feishu_oauth_card_flow.py');
 const IMAGE_TMP_ROOT = join(PROJECT_ROOT, '.local', 'tmp', 'images');
 
+function runDetached(fn, { label = 'background task', logger = console } = {}) {
+  const schedule = typeof setImmediate === 'function' ? setImmediate : (cb) => setTimeout(cb, 0);
+  schedule(() => {
+    Promise.resolve()
+      .then(fn)
+      .catch((err) => logger.error?.(`[${label}] 执行异常：`, err.message || String(err)));
+  });
+}
+
+function workflowStartedMessage(workflow = {}) {
+  return [
+    `已启动工作流：${workflow.title || workflow.workflowId}`,
+    `ID：${workflow.workflowId}`,
+    '任务已转入后台执行，可用 workflow_status 查询进度。',
+  ].join('\n');
+}
+
+async function notifyWorkflowConfirmation(result = {}, ctx = {}) {
+  const workflow = result.workflow;
+  const action = buildWorkflowApprovalAction(workflow, {
+    confirmationKey: ctx.confirmationKey || '',
+  });
+  if (typeof ctx.workflowApprovalSink === 'function') {
+    try {
+      await ctx.workflowApprovalSink(action, workflow);
+      return {
+        needConfirm: true,
+        actionId: action.id,
+        confirmToken: action.confirmToken,
+        workflowId: workflow.workflowId,
+        message: action.preview,
+      };
+    } catch (err) {
+      ctx.logger?.warn?.(`[workflow] 确认卡片登记/发送失败，尝试文本确认兜底：${err.message || String(err)}`);
+    }
+  }
+  if (typeof ctx.registerPendingWrite === 'function') {
+    ctx.registerPendingWrite(action);
+    return {
+      needConfirm: true,
+      actionId: action.id,
+      confirmToken: action.confirmToken,
+      workflowId: workflow.workflowId,
+      message: action.preview,
+    };
+  }
+  return { error: 'workflow 已进入等待确认，但当前入口不支持登记确认动作', workflowId: workflow.workflowId };
+}
+
+function startWorkflowInBackground({ stateStore, workflow, ctx, logger = console } = {}) {
+  runDetached(async () => {
+    const runner = createRuntimeWorkflowRunner({
+      stateStore,
+      progressSink: ctx.workflowProgressSink,
+      workflow,
+      ctx,
+    });
+    const result = await runner.run(workflow.workflowId);
+    if (result.status === 'waiting_confirmation') {
+      await notifyWorkflowConfirmation(result, ctx);
+    }
+  }, { label: `workflow:${workflow.workflowId}`, logger });
+}
+
 // ============ feishu-skill 文档读取（供 read_skill / list_skills）============
 // 安全地读取 SKILL_ROOT 下的文件，禁止路径穿越
 function safeReadSkill(relPath) {
@@ -1911,6 +1975,7 @@ const TOOLS = [
         require_confirmation: { type: 'boolean', description: '为 true 时若 steps 中没有 confirm，会自动追加确认步骤' },
         confirmation_message: { type: 'string', description: '确认步骤展示给用户的确认内容' },
         target_chars: { type: 'number', minimum: 500, maximum: 12000, description: '报告目标长度，doc_report 可选，默认约 1200 字以上' },
+        run_async: { type: 'boolean', description: '为 true 时只创建 workflow 并转入后台执行，立即返回启动状态。长任务建议使用。' },
       },
       required: ['user_goal'],
     },
@@ -1924,6 +1989,7 @@ const TOOLS = [
       require_confirmation = false,
       confirmation_message = '',
       target_chars,
+      run_async = false,
     }, ctx) {
       const stateStore = ctx.stateStore;
       if (!stateStore?.saveWorkflow || !stateStore?.getWorkflow) {
@@ -1947,6 +2013,16 @@ const TOOLS = [
         },
       });
       stateStore.saveWorkflow(workflow);
+      if (run_async) {
+        startWorkflowInBackground({ stateStore, workflow, ctx });
+        return {
+          ok: true,
+          startedAsync: true,
+          workflowId: workflow.workflowId,
+          workflow: workflowSummary(workflow),
+          message: workflowStartedMessage(workflow),
+        };
+      }
       const runner = createRuntimeWorkflowRunner({
         stateStore,
         progressSink: ctx.workflowProgressSink,
@@ -1955,20 +2031,7 @@ const TOOLS = [
       });
       const result = await runner.run(workflow.workflowId);
       if (result.status === 'waiting_confirmation') {
-        if (typeof ctx.registerPendingWrite !== 'function') {
-          return { error: 'workflow 已进入等待确认，但当前入口不支持登记确认动作', workflowId: result.workflow.workflowId };
-        }
-        const action = buildWorkflowApprovalAction(result.workflow, {
-          confirmationKey: ctx.confirmationKey || '',
-        });
-        ctx.registerPendingWrite(action);
-        return {
-          needConfirm: true,
-          actionId: action.id,
-          confirmToken: action.confirmToken,
-          workflowId: result.workflow.workflowId,
-          message: action.preview,
-        };
+        return notifyWorkflowConfirmation(result, ctx);
       }
       return {
         ok: result.status === 'completed',
@@ -1993,7 +2056,7 @@ const TOOLS = [
       required: [],
     },
     ownerOnly: true,
-    run({ workflow_id, status, limit = 5 }, ctx) {
+    async run({ workflow_id, status, limit = 5 }, ctx) {
       const stateStore = ctx.stateStore;
       if (!stateStore?.getWorkflow || !stateStore?.listWorkflows) {
         return { error: '运行态状态存储不可用，无法查询 workflow' };
@@ -2002,6 +2065,17 @@ const TOOLS = [
       if (id) {
         const workflow = stateStore.getWorkflow(id);
         if (!workflow) return { error: `未找到 workflow：${id}` };
+        if (workflow.status === 'waiting_confirmation' || workflow.requiresConfirmation) {
+          const confirmation = await notifyWorkflowConfirmation({ workflow }, ctx);
+          return {
+            workflow: workflowSummary(workflow),
+            detail: formatWorkflowForUser(workflow),
+            needConfirm: true,
+            actionId: confirmation.actionId,
+            confirmToken: confirmation.confirmToken,
+            message: confirmation.message || 'workflow 正在等待确认，已尝试重新发送确认入口。',
+          };
+        }
         return { workflow: workflowSummary(workflow), detail: formatWorkflowForUser(workflow) };
       }
       const rows = stateStore
@@ -2009,6 +2083,46 @@ const TOOLS = [
         .slice(0, Math.max(1, Math.min(20, Number(limit) || 5)))
         .map(workflowSummary);
       return { workflows: rows, count: rows.length };
+    },
+  },
+
+  {
+    name: 'workflow_confirm',
+    description:
+      '确认一个正在等待人工确认的 durable workflow。仅当主人明确要求确认/继续指定 workflow 时使用。' +
+      '用于确认卡片未弹出、卡片失效、pending approval 丢失后的恢复。',
+    parameters: {
+      type: 'object',
+      properties: {
+        workflow_id: { type: 'string', description: '要确认继续的 workflowId' },
+        resume_token: { type: 'string', description: 'workflow_status 返回的 resumeToken/确认码，可选但推荐提供' },
+      },
+      required: ['workflow_id'],
+    },
+    ownerOnly: true,
+    async run({ workflow_id, resume_token = '' }, ctx) {
+      const stateStore = ctx.stateStore;
+      if (!stateStore?.getWorkflow || !stateStore?.saveWorkflow) {
+        return { error: '运行态状态存储不可用，无法确认 workflow' };
+      }
+      const workflow = stateStore.getWorkflow(workflow_id);
+      if (!workflow) return { error: `未找到 workflow：${workflow_id}` };
+      if (workflow.status !== 'waiting_confirmation' && !workflow.requiresConfirmation) {
+        return { error: `workflow 当前不需要确认，状态为 ${workflow.status}` };
+      }
+      const runner = createRuntimeWorkflowRunner({
+        stateStore,
+        workflow,
+        progressSink: ctx.workflowProgressSink,
+        ctx,
+      });
+      const result = await runner.confirm(workflow_id, { token: resume_token });
+      if (result.ok === false) return { error: result.reason || 'workflow 确认失败', workflow: workflowSummary(result.workflow) };
+      return {
+        ok: result.status === 'completed',
+        workflow: workflowSummary(result.workflow),
+        message: formatWorkflowRunResult(result),
+      };
     },
   },
 

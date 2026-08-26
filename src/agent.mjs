@@ -70,9 +70,9 @@ function toolAvailable(tools = [], name = '') {
 }
 
 function docReportTargetChars(text = '') {
-  if (/(详细|完整|深入|全面|长文|长报告|深度|详尽)/i.test(text)) return 3000;
-  if (/(简短|简版|一句话|简单|大概|快速)/i.test(text)) return 900;
-  return 1800;
+  if (/(详细|完整|深入|全面|长文|长报告|深度|详尽)/i.test(text)) return 8000;
+  if (/(简短|简版|一句话|简单|大概|快速)/i.test(text)) return 1800;
+  return 4500;
 }
 
 function shouldAutoStartDocReportWorkflow(text = '', ctx = {}, tools = []) {
@@ -410,6 +410,7 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
       groupMemoryBriefPreview: previewForTrace(ctx.groupMemoryBrief || ''),
     });
     if (shouldAutoStartDocReportWorkflow(text, ctx, tools)) {
+      console.log(`[agent:${state.runId}] route=doc_report async=true`);
       state.trace.step('route', {
         target: 'start_workflow',
         workflowType: 'doc_report',
@@ -420,9 +421,11 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
         user_goal: text,
         workflow_type: 'doc_report',
         target_chars: docReportTargetChars(text),
+        run_async: true,
       }, ctx);
       const response = result?.message
         || (result?.error ? `执行失败：${result.error}` : '已创建文档总结工作流。');
+      console.log(`[agent:${state.runId}] route result status=${result?.startedAsync ? 'started_async' : result?.needConfirm ? 'need_confirm' : result?.ok ? 'ok' : result?.error ? 'error' : 'unknown'} workflow=${result?.workflowId || result?.workflow?.workflowId || ''}`);
       state.trace.step('respond', {
         status: result?.needConfirm ? 'need_confirm' : result?.ok ? 'ok' : result?.error ? 'error' : 'ok',
         content: response,
@@ -436,9 +439,11 @@ export async function runAgent(userText, ctx = {}, deps = {}) {
     // reason ↔ act ↔ guard ↔ observe 循环
     while (true) {
       const reasonStarted = Date.now();
+      console.log(`[agent:${state.runId}] reason start iter=${state.iter + 1} model=${state.model}`);
       const msg = await callLLM(state.messages, { tools, task: state.task, model: state.model }); // reason 节点
       const reasonDurationMs = Date.now() - reasonStarted;
       const calls = msg.tool_calls || [];
+      console.log(`[agent:${state.runId}] reason done iter=${state.iter + 1} durationMs=${reasonDurationMs} toolCalls=${calls.length}`);
       state.trace.step('reason', {
         durationMs: reasonDurationMs,
         toolCalls: calls.map((tc) => tc.function?.name || ''),

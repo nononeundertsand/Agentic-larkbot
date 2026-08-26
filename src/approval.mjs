@@ -71,7 +71,11 @@ export class ApprovalStore {
       return { kind: 'cancel', action };
     }
 
-    // 用户转而提出新请求时作废旧审批，避免稍后的简短“ok”误触发。
+    // workflow 是可查询、可恢复的长任务。等待确认期间，用户经常会先查询进度或失败原因；
+    // 这些普通消息不应隐式取消 workflow，只有明确“取消”或点击取消按钮才取消。
+    if (action.executor === 'workflow') return { kind: 'none', action };
+
+    // 普通写审批保持原策略：用户转而提出新请求时作废旧审批，避免稍后的简短“ok”误触发。
     this.deletePending(confirmationKey);
     return { kind: 'superseded', action };
   }

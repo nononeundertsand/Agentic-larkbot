@@ -138,8 +138,8 @@ async function chatLLM(messages, { temperature, task, model, maxTokens } = {}) {
 }
 
 // 底层调用（支持工具）：返回完整的 assistant message 对象（可能含 tool_calls）。
-export async function chatLLMRaw(messages, { tools, temperature, task, model } = {}) {
-  return requestLLM(messages, { tools, temperature, task, model });
+export async function chatLLMRaw(messages, { tools, temperature, task, model, maxTokens } = {}) {
+  return requestLLM(messages, { tools, temperature, task, model, maxTokens });
 }
 
 // Agent 编排循环（旧实现，保留作为回滚 fallback）：LLM 自主决定调用哪些工具，代码执行后回灌结果，直到产出最终答复。

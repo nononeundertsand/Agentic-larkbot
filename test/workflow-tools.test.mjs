@@ -18,6 +18,19 @@ function tempState() {
   return { dir, file: join(dir, 'state.json') };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(predicate, { timeoutMs = 1500, intervalMs = 20 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(intervalMs);
+  }
+  return Boolean(predicate());
+}
+
 test('start_workflow 可创建并完成无确认的持久 workflow', async () => {
   const { dir, file } = tempState();
   try {
@@ -146,6 +159,68 @@ test('start_workflow 的 doc_report 类型会自动使用 W2 默认 worker', asy
     assert.equal(stored.metadata.deliveryChatId, 'oc_group');
     assert.ok(stored.artifacts.report_draft);
     assert.equal(stored.artifacts.report_document.content.url, 'https://bytedance.larkoffice.com/docx/docx_report');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('start_workflow 支持后台执行并异步登记确认动作', async () => {
+  const { dir, file } = tempState();
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const progressEvents = [];
+    const approvals = [];
+    const result = await executeTool('start_workflow', {
+      title: '后台文档报告',
+      user_goal: '请总结 https://bytedance.larkoffice.com/wiki/LpxGwSMfDiZwAkkztg2crzoPnQh 并生成带引用报告',
+      workflow_type: 'doc_report',
+      target_chars: 800,
+      run_async: true,
+    }, {
+      isOwner: true,
+      senderId: 'ou_owner',
+      chatId: 'oc_group',
+      sessionKey: 'g:oc_group:ou_owner',
+      confirmationKey: 'g:oc_group:ou_owner',
+      stateStore,
+      workflowProgressSink(event) {
+        progressEvents.push(event.type);
+      },
+      workflowApprovalSink(action) {
+        approvals.push(action);
+      },
+      docReportDeps: {
+        readSource: async () => {
+          await sleep(30);
+          return { ok: true, text: '后台任务读取文档，生成引用报告并等待确认发送链接。' };
+        },
+        generateReport: async ({ chunks }) => ({
+          content: `# 后台报告\n\n- 后台任务应先返回，再异步确认。 [${chunks[0].citationId}]\n\n## 引用来源\n- [${chunks[0].citationId}] ${chunks[0].sourceTitle}`,
+          claims: [{ text: '后台任务应先返回', citationIds: [chunks[0].citationId] }],
+          citationIds: [chunks[0].citationId],
+        }),
+        createDocument: async () => ({
+          ok: true,
+          url: 'https://bytedance.larkoffice.com/docx/docx_async',
+          token: 'docx_async',
+        }),
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.startedAsync, true);
+    assert.match(result.message, /已启动工作流/);
+    assert.equal(approvals.length, 0);
+
+    const notified = await waitFor(() => approvals.length === 1);
+    assert.equal(notified, true);
+    assert.equal(approvals[0].executor, 'workflow');
+    assert.match(approvals[0].preview, /docx_async/);
+    assert.ok(progressEvents.includes('started'));
+    assert.ok(progressEvents.includes('waiting_confirmation'));
+    const stored = stateStore.getWorkflow(result.workflowId);
+    assert.equal(stored.status, 'waiting_confirmation');
+    assert.equal(stored.artifacts.report_document.content.url, 'https://bytedance.larkoffice.com/docx/docx_async');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -292,6 +367,84 @@ test('workflow_status 可按当前会话列出最近 workflow', async () => {
 
     const single = await executeTool('workflow_status', { workflow_id: first.workflow.workflowId }, ctx);
     assert.match(single.detail, /会话内任务/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workflow_status 查询等待确认的 workflow 会补登确认动作', async () => {
+  const { dir, file } = tempState();
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const approvals = new ApprovalStore({ ttlMs: 10000, stateStore });
+    const ctx = {
+      isOwner: true,
+      senderId: 'ou_owner',
+      sessionKey: 'p:ou_owner',
+      confirmationKey: 'p:ou_owner',
+      stateStore,
+      registerPendingWrite(action) {
+        approvals.register('p:ou_owner', action);
+      },
+    };
+    const started = await executeTool('start_workflow', {
+      title: '待确认任务',
+      user_goal: '生成后确认',
+      steps: [
+        { id: 'draft', type: 'transform', title: '生成草稿' },
+        { id: 'confirm', type: 'confirm', title: '确认继续', input: { message: '是否继续' } },
+      ],
+    }, ctx);
+    assert.equal(started.needConfirm, true);
+    stateStore.deleteApproval('p:ou_owner');
+
+    const status = await executeTool('workflow_status', { workflow_id: started.workflowId }, ctx);
+
+    assert.equal(status.needConfirm, true);
+    assert.match(status.message, /确认码/);
+    const pending = stateStore.loadApprovals({ ttlMs: 10000 })[0];
+    assert.equal(pending.executor, 'workflow');
+    assert.equal(pending.workflow.workflowId, started.workflowId);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('workflow_confirm 可恢复确认 pending approval 丢失的 workflow', async () => {
+  const { dir, file } = tempState();
+  try {
+    const stateStore = new RuntimeStateStore({ file });
+    const started = await executeTool('start_workflow', {
+      title: '显式确认任务',
+      user_goal: '生成后确认',
+      steps: [
+        { id: 'draft', type: 'transform', title: '生成草稿' },
+        { id: 'confirm', type: 'confirm', title: '确认继续', input: { message: '是否继续' } },
+        { id: 'verify', type: 'verify', title: '检查结果' },
+      ],
+    }, {
+      isOwner: true,
+      senderId: 'ou_owner',
+      sessionKey: 'p:ou_owner',
+      stateStore,
+      registerPendingWrite() {},
+    });
+    assert.equal(started.needConfirm, true);
+    const waiting = stateStore.getWorkflow(started.workflowId);
+
+    const confirmed = await executeTool('workflow_confirm', {
+      workflow_id: started.workflowId,
+      resume_token: waiting.resumeToken,
+    }, {
+      isOwner: true,
+      senderId: 'ou_owner',
+      sessionKey: 'p:ou_owner',
+      stateStore,
+    });
+
+    assert.equal(confirmed.ok, true);
+    assert.match(confirmed.message, /工作流已完成/);
+    assert.equal(stateStore.getWorkflow(started.workflowId).status, 'completed');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
